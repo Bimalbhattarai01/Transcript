@@ -1,0 +1,15 @@
+.env
+.cache/
+out/
+*.test.srt
+failures.txt
+__pycache__/
+.venv/
+downloads/
+outputs/
+bin/
+
+*.srt
+*.zip
+comparision/
+test/
