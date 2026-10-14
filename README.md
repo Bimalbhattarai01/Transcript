@@ -61,7 +61,7 @@ python3 transcribe.py episode.mp3
 python3 transcribe.py /path/to/episodes
 ```
 
-## Run it on a server (VPS)
+## Run it on a server without Docker (systemd)
 
 1. Copy the project to the server, e.g. `/opt/transcript` (`git clone` or `rsync`), then `sudo APP_DIR=/opt/transcript bash deploy/setup.sh`.
    It installs ffmpeg/node, a venv with `requirements-vps.txt` (no torch), yt-dlp, and a systemd service `transcribe-ui`.
@@ -98,3 +98,20 @@ $M deluser alice
 ```
 
 Update the server later with `cd /opt/transcript && git pull` (use the deploy key as above), `sudo chown -R srt:srt /opt/transcript`, `sudo systemctl restart transcribe-ui`. An existing database upgrades itself.
+
+## Run it with Docker (recommended on the server)
+
+Self-contained: its own image and volume, nothing else on the host is touched. CPU is capped at 3 cores and 4 GB RAM in `docker-compose.yml`; change it there.
+
+```bash
+cp .env.example .env && nano .env        # OPENROUTER_API_KEY (the file is NOT copied into the image)
+docker compose up -d --build
+docker compose exec srt python manage.py adduser you@example.com    # asks for a password (min 10 chars); repeat per teammate
+docker compose logs -f srt
+```
+
+- The container refuses to start until a user exists, so it can never come up without a login. Create the user right after the first `up` (it restarts by itself until then), or run `docker compose run --rm srt python manage.py adduser NAME` first.
+- Port: published on `127.0.0.1:8765` only. nginx on the host proxies to it (`deploy/nginx.conf`). If your nginx runs in Docker, put `BIND_ADDR=172.17.0.1` in `.env` and proxy to `http://172.17.0.1:8765`; never publish it on `0.0.0.0` without the proxy and HTTPS.
+- Data (database, downloads, outputs, speaker models, yt-dlp) lives in the `srt-data` volume; yt-dlp updates itself on every start. Back up with `docker run --rm -v srt-data:/d -v "$PWD":/b alpine tar czf /b/srt-data.tgz -C /d .`
+- YouTube blocking the server: uncomment the `cookies.txt` volume line in `docker-compose.yml` and set `YT_COOKIES=/data/cookies.txt` in `.env`.
+- Update: `git pull && docker compose up -d --build`. Team commands: `docker compose exec srt python manage.py listusers|passwd|disable|enable|deluser NAME`.
