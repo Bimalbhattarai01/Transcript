@@ -41,6 +41,7 @@ python3 ui.py
 ```
 
 Open http://127.0.0.1:8765. Paste one link (or switch to **Many videos** for a list, or a playlist/channel link), pick a start/end time and a model, click **Generate SRT**.
+No link needed: the **Upload file** tab takes mp3/m4a/wav/mp4/mkv/webm... files (limit `MAX_UPLOAD_MB`, default 2048), which is also the way around YouTube blocking a server.
 Use **Projects** (left sidebar, like ChatGPT) to keep each channel or show separate: pick a project when you queue a video, or let a playlist/channel link suggest one. Hover a transcript or project to delete it; open a transcript to move it to another project. Your name and **Log out** are in the menu at the top right.
 Jobs go into a queue stored in SQLite (`data/app.db`); the **History** sidebar lists every job, and a job interrupted by a restart resumes. SRTs are also written to `outputs/`.
 

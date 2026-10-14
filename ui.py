@@ -24,6 +24,8 @@ DATA = Path(os.environ.get("DATA_DIR") or ROOT)
 DL, OUT, DB_PATH = DATA / "downloads", DATA / "outputs", db.default_path()
 REQUIRE_LOGIN = False  # set at startup: non-loopback host or UI_REQUIRE_LOGIN=1 (login is also on whenever a user exists)
 DEFAULT_STT = ["qwen/qwen3-asr-1.7b"]
+MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_MB", "2048")) * 1024 * 1024
+UP = re.compile(r"[0-9a-f]{12}\.(?:mp3|m4a|wav|mp4|mkv|webm|ogg|flac|aac|mov|opus)")  # names we generate for uploaded files
 YT = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/")
 _models = {"t": 0, "data": None}
 
@@ -101,6 +103,11 @@ class JobIO:
 
 
 def download(io, url, vid):
+    if url.startswith("upload:"):  # a file the team uploaded: nothing to download
+        p = DL / url[7:]
+        if not p.exists(): raise RuntimeError("the uploaded file is gone (deleted or server reset); upload it again")
+        io.log(f"Using the uploaded file ({p.stat().st_size // 1024 // 1024} MB)")
+        return str(p)
     if vid and (DL / f"{vid}.mp3").exists():  # same video again: skip the download
         io.log(f"Using cached audio {vid}.mp3")
         return str(DL / f"{vid}.mp3")
@@ -120,6 +127,17 @@ def download(io, url, vid):
     if p.wait() != 0 or not path: raise RuntimeError("yt-dlp failed (see log)")
     io.log(f"Downloaded {Path(path).name}")
     return path
+
+
+def norm_item(it):
+    """A queue item from the browser -> {url, id, title}, or None if it is neither a YouTube link nor one of our uploads."""
+    up = it.get("upload")
+    if up:
+        if UP.fullmatch(up) and (DL / up).exists():
+            return {"url": "upload:" + up, "id": up.split(".")[0], "title": str(it.get("title") or up)[:200]}
+        return None
+    u = it.get("url") or ""
+    return {"url": u, "id": video_id(u), "title": it.get("title")} if YT.match(u) and video_id(u) else None
 
 
 def run_one(j):
@@ -300,6 +318,28 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, buf.getvalue(), "application/zip", {"Content-Disposition": 'attachment; filename="transcripts.zip"'})
         self.send(404, "{}")
 
+    def upload(self):
+        """POST /api/upload?name=<original filename>, raw file as the body; stored as downloads/<12 hex>.<ext>."""
+        name = (parse_qs(urlparse(self.path).query).get("name") or [""])[0]
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if not UP.fullmatch("0" * 12 + "." + ext): return self.err("Unsupported file type. Use mp3, m4a, wav, mp4, mkv, webm, ogg, flac, aac, mov or opus.")
+        size = int(self.headers.get("Content-Length") or 0)
+        if size <= 0: return self.err("Empty upload")
+        if size > MAX_UPLOAD: return self.err(f"File is too large (limit {MAX_UPLOAD // 1024 // 1024} MB)", 413)
+        DL.mkdir(parents=True, exist_ok=True)
+        fid = secrets.token_hex(6)
+        dest = DL / f"{fid}.{ext}"
+        try:
+            with open(dest, "wb") as f:
+                left = size
+                while left:
+                    chunk = self.rfile.read(min(1 << 20, left))
+                    if not chunk: raise ConnectionError("upload interrupted")
+                    f.write(chunk); left -= len(chunk)
+        except Exception:
+            dest.unlink(missing_ok=True); raise
+        self.send(200, json.dumps({"file": dest.name, "title": name.rsplit(".", 1)[0][:200] or dest.name, "bytes": size}))
+
     # ---------- POST ----------
     def do_POST(self):
         if self.path == "/login":
@@ -318,6 +358,7 @@ class H(BaseHTTPRequestHandler):
             for k in keys: fails[k].append(now)
             return self.send(401, LOGIN.replace("{{ERR}}", "Wrong username or password."), "text/html; charset=utf-8")
         if not self.authed(): return self.err("login required", 401)
+        if self.path.startswith("/api/upload"): return self.upload()
         d = self.jbody()
         if self.path == "/api/expand":
             items, skipped, expanded, seen, suggest = [], [], False, set(), ""
@@ -342,8 +383,8 @@ class H(BaseHTTPRequestHandler):
             if end is not None and end <= start: return self.err("End time must be after start time")
             hint = ",".join(n.strip() for n in (d.get("speakers") or "").split(",") if n.strip())
             label = bool(d.get("label", True))
-            items = [it for it in (d.get("items") or []) if YT.match(it.get("url") or "") and video_id(it["url"])]
-            if not items: return self.err("Paste a valid YouTube link")
+            items = [n for n in map(norm_item, d.get("items") or []) if n]
+            if not items: return self.err("Paste a valid YouTube link or upload a file")
             project_id = None
             try:
                 if (d.get("new_project") or "").strip(): project_id = db.add_project(d["new_project"], self.user["username"] if self.user else None)
@@ -355,7 +396,7 @@ class H(BaseHTTPRequestHandler):
             batch = db.add_batch(f"{len(items)} videos") if len(items) > 1 else None
             ids, dup = [], 0
             for it in items:
-                vid = video_id(it["url"])
+                vid = it["id"]
                 if db.active_duplicate(vid, start, end, model, hint, label): dup += 1; continue
                 ids.append(db.add_job(batch, it["url"], vid, it.get("title"), start, end, model, hint, label,
                                       self.user["username"] if self.user else None, project_id))
@@ -481,6 +522,7 @@ h1{font-size:34px;line-height:1.18;font-weight:600;letter-spacing:-.025em;margin
 .lede{color:var(--mut);font-size:16px;margin:0 0 28px;max-width:560px}
 .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:24px;box-shadow:0 1px 2px #1b1f2e08}
 label{display:block;font-size:13px;font-weight:500;color:var(--sub);margin:0 0 6px}label i{font-style:normal;color:var(--mut);font-weight:400}
+input[type=file]{height:auto;padding:9px 10px;font-size:13.5px}input[type=file]::file-selector-button{font:inherit;font-size:13px;font-weight:500;border:1px solid var(--line);background:#f5f6fa;border-radius:8px;padding:6px 12px;margin-right:12px;cursor:pointer}
 input,select,textarea{width:100%;height:42px;font-size:14px;color:var(--ink);padding:0 12px;border:1px solid var(--line);border-radius:10px;background:#fff;outline:none;transition:border-color .12s,box-shadow .12s}
 textarea{height:112px;padding:10px 12px;resize:vertical;line-height:1.5}
 input::placeholder,textarea::placeholder{color:#a9aebd}input:focus,select:focus,textarea:focus{border-color:var(--g);box-shadow:0 0 0 3px #1f7a5c1a}
@@ -541,8 +583,10 @@ dialog h3{margin:0 0 6px;font-size:17px;font-weight:600;letter-spacing:-.01em}di
  <h1>Turn a YouTube link into a speaker-labelled SRT</h1>
  <p class=lede>Paste one link, many links, or a whole playlist or channel. Every subtitle line comes back with who is speaking.</p>
  <div class=card>
-  <div class=seg><button class=on id=m1>One video</button><button id=mN>Many videos</button></div>
+  <div class=seg><button class=on id=m1>One video</button><button id=mN>Many videos</button><button id=mF>Upload file</button></div>
   <div class=f id=f1><label>YouTube link</label><input id=url placeholder="https://www.youtube.com/watch?v=..."></div>
+  <div class=f id=fF hidden><label>Audio or video files <i>(mp3, m4a, wav, mp4, mkv, webm … you can pick several)</i></label>
+   <input type=file id=file multiple accept="audio/*,video/*,.mp3,.m4a,.wav,.mp4,.mkv,.webm,.ogg,.flac,.aac,.mov,.opus"></div>
   <div class=f id=fN hidden><label>Links <i>(one per line; playlist and channel links are expanded)</i></label><textarea id=urls placeholder="https://www.youtube.com/watch?v=...&#10;https://www.youtube.com/playlist?list=..."></textarea></div>
   <div class="two f">
    <div><label>Start time</label><select id=start></select></div>
@@ -634,9 +678,9 @@ async function init(){
  if(M.stt.some(m=>m.id==M.default_stt[0]))$('model').value=M.default_stt[0];
  await loadProjects();await loadList();setInterval(tick,2500);
 }
-function setMode(m){mode=m;$('m1').className=m=='one'?'on':'';$('mN').className=m=='many'?'on':'';$('f1').hidden=m!='one';$('fN').hidden=m!='many';
- $('go').textContent=m=='one'?'Generate SRT':'Add to queue';$('review').hidden=true;$('err').textContent=$('okmsg').textContent=''}
-$('m1').onclick=()=>setMode('one');$('mN').onclick=()=>setMode('many');
+function setMode(m){mode=m;$('m1').className=m=='one'?'on':'';$('mN').className=m=='many'?'on':'';$('mF').className=m=='file'?'on':'';$('f1').hidden=m!='one';$('fN').hidden=m!='many';$('fF').hidden=m!='file';
+ $('go').textContent=m=='one'?'Generate SRT':m=='file'?'Upload & generate':'Add to queue';$('review').hidden=true;$('err').textContent=$('okmsg').textContent=''}
+$('m1').onclick=()=>setMode('one');$('mN').onclick=()=>setMode('many');$('mF').onclick=()=>setMode('file');
 function showNew(){sel=null;loaded=null;$('pNew').hidden=false;$('pJob').hidden=true;renderList()}
 $('newbtn').onclick=showNew;
 
@@ -711,7 +755,7 @@ async function pollJob(){
  $('jtitle').textContent=j.title||j.video_id||j.url;
  if(document.activeElement!==$('jproj'))$('jproj').value=j.project_id==null?'':String(j.project_id);
  const range=(j.start_s||j.end_s)?` · ${fmt(j.start_s||0)}–${j.end_s?fmt(j.end_s):'end'}`:'';
- $('jmeta').innerHTML=`<a href="${esc(j.url)}" target=_blank rel=noopener>Open on YouTube</a> · ${esc(j.model)}${range}${j.label_speakers?'':' · no speaker labels'} · added ${ago(j.created_at)}${j.created_by?' by '+esc(j.created_by):''}`;
+ $('jmeta').innerHTML=`${j.url.startsWith('upload:')?'Uploaded file':`<a href="${esc(j.url)}" target=_blank rel=noopener>Open on YouTube</a>`} · ${esc(j.model)}${range}${j.label_speakers?'':' · no speaker labels'} · added ${ago(j.created_at)}${j.created_by?' by '+esc(j.created_by):''}`;
  const live=j.status=='queued'||j.status=='running';
  $('jrun').hidden=j.status=='done';
  $('bar').style.width=(j.status=='error'?0:j.progress||0)+'%';
@@ -739,6 +783,11 @@ $('retryall').onclick=async()=>{await api('/api/retry',{all_failed:true});await 
 /* ---- new transcript form ---- */
 const params=()=>({start:+$('start').value,end:$('end').value===''?null:+$('end').value,model:$('model').value,speakers:$('spknames').value,label:$('label').checked});
 const projParams=()=>{const v=$('proj').value;return v==='__new'?{new_project:$('newproj').value.trim()}:v===''?{}:{project_id:+v}};
+function uploadFile(f,onPct){return new Promise((res,rej)=>{
+ const x=new XMLHttpRequest();x.open('POST','/api/upload?name='+encodeURIComponent(f.name));
+ x.upload.onprogress=e=>{if(e.lengthComputable)onPct(Math.round(100*e.loaded/e.total))};
+ x.onload=()=>{if(x.status==401){location='/login';return}let d={};try{d=JSON.parse(x.responseText)}catch(e){}x.status==200?res(d):rej(new Error(d.error||'Upload failed'))};
+ x.onerror=()=>rej(new Error('Upload failed (connection lost)'));x.send(f)})}
 async function enqueue(items){
  const p=params();if(p.end!=null&&p.end<=p.start)return {error:'End time must be after start time'};
  const pp=projParams();if('new_project' in pp&&!pp.new_project)return {error:'Type a name for the new project'};
@@ -751,7 +800,17 @@ $('go').onclick=async()=>{
  const p=params();if(p.end!=null&&p.end<=p.start)return $('err').textContent='End time must be after start time';
  $('go').disabled=true;
  try{
-  if(mode=='one'){
+  if(mode=='file'){
+   const files=[...$('file').files];if(!files.length)return $('err').textContent='Choose at least one file';
+   const items=[];
+   for(let i=0;i<files.length;i++){
+    const f=files[i];
+    try{const u=await uploadFile(f,pct=>$('okmsg').textContent=`Uploading ${i+1}/${files.length}: ${f.name} ${pct}%`);items.push({upload:u.file,title:u.title})}
+    catch(e){$('okmsg').textContent='';return $('err').textContent=e.message||'Upload failed'}
+   }
+   $('okmsg').textContent='';const r=await enqueue(items);if(r.error)return $('err').textContent=r.error;
+   $('file').value='';await refresh();if(r.ids.length==1)openJob(r.ids[0]);else $('okmsg').textContent=`Queued ${r.queued} file${r.queued==1?'':'s'}`;
+  }else if(mode=='one'){
    const r=await enqueue([{url:$('url').value.trim()}]);if(r.error)return $('err').textContent=r.error;
    $('url').value='';await refresh();const id=r.ids[0];if(id)openJob(id);else $('okmsg').textContent='Already in the queue.';
   }else{
