@@ -67,7 +67,8 @@ python3 transcribe.py /path/to/episodes
    It installs ffmpeg/node, a venv with `requirements-vps.txt` (no torch), yt-dlp, and a systemd service `transcribe-ui`.
 2. Edit `/opt/transcript/.env`: `OPENROUTER_API_KEY`, `UI_USER` (default `admin`) and a long `UI_PASSWORD` (single login). The server refuses to listen on a non-loopback address without a password.
 3. `sudo systemctl start transcribe-ui` and watch `journalctl -u transcribe-ui -f`.
-4. HTTPS: the app listens on `127.0.0.1:8765` only. Put a reverse proxy in front: `deploy/nginx.conf` (add it to your existing nginx, then `certbot --nginx -d your.domain`) or `deploy/Caddyfile`.
+4. **Simplest and touches nothing else:** open it through an SSH tunnel from your own computer: `ssh -L 8765:127.0.0.1:8765 user@your-server`, then browse http://127.0.0.1:8765. No proxy change, no public port, nothing exposed.
+   A public URL (optional, later): the app listens on `127.0.0.1:8765` only. Put a reverse proxy in front: `deploy/nginx.conf` (add it to your existing nginx, then `certbot --nginx -d your.domain`) or `deploy/Caddyfile`.
    If the proxy runs in Docker it cannot reach the host's `127.0.0.1`: set `UI_HOST=172.17.0.1` (the Docker bridge address; `UI_PASSWORD` is then mandatory), point the proxy at `http://172.17.0.1:8765`, and make sure the firewall does not expose port 8765 to the internet.
 
 The service runs at low priority (`Nice=10`, `CPUQuota=300%`, `MemoryMax=4G`, `DIARIZE_THREADS=3`) so other services on the same machine stay responsive; adjust in `deploy/transcribe-ui.service`.
