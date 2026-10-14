@@ -12,7 +12,7 @@ from env import load_env
 
 load_env()
 MODEL = "pyannote/speaker-diarization-3.1"
-MODELS = Path(os.environ.get("DATA_DIR") or Path(__file__).parent) / "models"  # a Docker volume when DATA_DIR=/data
+MODELS = Path(os.environ.get("DATA_DIR") or Path(__file__).parent) / "models"
 SEG_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
 EMB_FILE = "wespeaker_en_voxceleb_resnet34_LM.onnx"  # English speaker embeddings, 26 MB
 EMB_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/" + EMB_FILE

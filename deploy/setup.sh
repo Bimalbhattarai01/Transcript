@@ -33,7 +33,7 @@ systemctl enable transcribe-ui
 cat <<MSG
 
 Done. This touched only: $APP_DIR, a new user '$APP_USER', the apt packages ffmpeg/python3-venv/python3-pip/curl, and /etc/systemd/system/transcribe-ui.service.
-Your other services, Docker and your proxy were not changed.
+Your other services and your proxy were not changed.
 Next:
   1. Edit $APP_DIR/.env : OPENROUTER_API_KEY, optionally YT_COOKIES
   2. Create the first team login (asks for a password, min 10 chars):
