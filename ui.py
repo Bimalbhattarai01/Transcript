@@ -3,8 +3,9 @@
 the audio (yt-dlp), transcribes it (OpenRouter) and labels the speakers -> SRT. History lives in the database (data/app.db).
 
 run:  python3 ui.py     then open http://127.0.0.1:8765
-env:  UI_PASSWORD (required when UI_HOST is not a loopback address), UI_HOST, UI_PORT, DATA_DIR, SESSION_SECRET,
-      YT_COOKIES (cookies.txt for yt-dlp), YT_PROXY, KEEP_AUDIO=0 (delete the mp3 after a job), DIARIZER, DIARIZE_SHIFT
+accounts: python3 manage.py adduser NAME  (login is required once a user exists, or when UI_REQUIRE_LOGIN=1 / UI_HOST is not loopback)
+env:  UI_HOST, UI_PORT, UI_REQUIRE_LOGIN, DATA_DIR, SESSION_SECRET, YT_COOKIES (cookies.txt for yt-dlp), YT_PROXY,
+      KEEP_AUDIO=0 (delete the mp3 after a job), DIARIZER, DIARIZE_SHIFT, DIARIZE_THREADS
 """
 import hashlib, hmac, io, json, os, re, secrets, subprocess, sys, threading, time, traceback, webbrowser, zipfile
 from argparse import Namespace
@@ -14,14 +15,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 import requests
+import auth
 import db
 import transcribe as T  # also loads .env
 
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get("DATA_DIR") or ROOT)
-DL, OUT, DB_PATH = DATA / "downloads", DATA / "outputs", DATA / "data" / "app.db"
-PASSWORD = os.environ.get("UI_PASSWORD") or ""
-USER = os.environ.get("UI_USER") or "admin"
+DL, OUT, DB_PATH = DATA / "downloads", DATA / "outputs", db.default_path()
+REQUIRE_LOGIN = False  # set at startup: non-loopback host or UI_REQUIRE_LOGIN=1 (login is also on whenever a user exists)
 DEFAULT_STT = ["qwen/qwen3-asr-1.7b"]
 YT = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/")
 _models = {"t": 0, "data": None}
@@ -180,21 +181,29 @@ def _secret():
     return f.read_text().strip().encode()
 
 
-def _sig(exp):  # bound to the user AND the password: changing either (or SESSION_SECRET) logs everyone out
-    return hmac.new(_secret(), f"{exp}|{USER}|{PASSWORD}".encode(), hashlib.sha256).hexdigest()
+def _sig(user, exp, pw_hash):  # bound to the user's password hash: a password change logs that user out everywhere
+    return hmac.new(_secret(), f"{user}|{exp}|{pw_hash[-24:]}".encode(), hashlib.sha256).hexdigest()
 
 
-def make_cookie():
+def make_cookie(user):
     exp = str(int(time.time()) + 30 * 86400)
-    return f"{exp}.{_sig(exp)}"
+    return f"{user['username']}.{exp}.{_sig(user['username'], exp, user['pw_hash'])}"
 
 
-def valid_cookie(v):
+def user_from_cookie(v):
+    """The (enabled) user a session cookie belongs to, or None. Re-read from the DB on every request."""
     try:
-        exp, sig = v.split(".")
-        return int(exp) > time.time() and hmac.compare_digest(sig, _sig(exp))
+        name, exp, sig = v.rsplit(".", 2)
+        u = db.get_user(name)
+        if u and not u["disabled"] and int(exp) > time.time() and hmac.compare_digest(sig, _sig(u["username"], exp, u["pw_hash"])):
+            return u
     except Exception:
-        return False
+        pass
+    return None
+
+
+def login_required():
+    return REQUIRE_LOGIN or db.count_users() > 0
 
 
 fails = {}  # ip -> recent failed login times
@@ -220,9 +229,12 @@ class H(BaseHTTPRequestHandler):
         return (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
 
     def authed(self):
-        if not PASSWORD: return True
+        """True when the request may proceed; sets self.user (None when login is off, e.g. local development)."""
+        self.user = None
+        if not login_required(): return True
         c = SimpleCookie(self.headers.get("Cookie") or "")
-        return "sess" in c and valid_cookie(c["sess"].value)
+        self.user = user_from_cookie(c["sess"].value) if "sess" in c else None
+        return self.user is not None
 
     def cookie_header(self, value, max_age):
         secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
@@ -244,11 +256,12 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path); parts = u.path.strip("/").split("/"); qs = parse_qs(u.query)
         if u.path == "/static/Inter.woff2" and (ROOT / "static" / "Inter.woff2").exists():
             return self.send(200, (ROOT / "static" / "Inter.woff2").read_bytes(), "font/woff2", {"Cache-Control": "max-age=31536000"})
-        if u.path == "/login": return self.send(200, LOGIN.replace("{{ERR}}", ""), "text/html; charset=utf-8") if PASSWORD else self.redirect("/")
+        if u.path == "/login": return self.send(200, LOGIN.replace("{{ERR}}", ""), "text/html; charset=utf-8") if login_required() else self.redirect("/")
         if u.path == "/logout": return self.redirect("/login", self.cookie_header("", 0))
         if not self.authed():
             return self.err("login required", 401) if u.path.startswith("/api/") else self.redirect("/login")
-        if u.path == "/": return self.send(200, PAGE.replace("{{AUTH}}", "1" if PASSWORD else ""), "text/html; charset=utf-8")
+        if u.path == "/": return self.send(200, PAGE.replace("{{USER}}", self.user["username"] if self.user else ""), "text/html; charset=utf-8")
+        if u.path == "/api/me": return self.send(200, json.dumps({"user": self.user["username"] if self.user else None}))
         if u.path == "/api/models": return self.send(200, json.dumps(get_models()))
         if u.path == "/api/jobs":
             return self.send(200, json.dumps({"jobs": db.list_jobs((qs.get("q") or [""])[0].strip()), "counts": db.counts()}))
@@ -280,16 +293,18 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/login":
             ip, now = self.ip(), time.time()
-            fails[ip] = [t for t in fails.get(ip, []) if now - t < 300]
-            if len(fails[ip]) >= 5:
-                return self.send(429, LOGIN.replace("{{ERR}}", "Too many attempts. Wait a few minutes."), "text/html; charset=utf-8")
             form = parse_qs(self.body().decode())
-            user, pw = (form.get("username") or [""])[0].strip(), (form.get("password") or [""])[0]
-            ok_user = hmac.compare_digest(user.encode(), USER.encode())  # evaluate both so timing doesn't reveal which was wrong
-            ok_pw = hmac.compare_digest(pw.encode(), PASSWORD.encode())
-            if PASSWORD and ok_user and ok_pw:
-                return self.redirect("/", self.cookie_header(make_cookie(), 30 * 86400))
-            fails[ip].append(now)
+            name, pw = (form.get("username") or [""])[0].strip().lower(), (form.get("password") or [""])[0]
+            keys = (ip, "user:" + name)
+            for k in keys: fails[k] = [t for t in fails.get(k, []) if now - t < 300]
+            if any(len(fails[k]) >= 5 for k in keys):
+                return self.send(429, LOGIN.replace("{{ERR}}", "Too many attempts. Wait a few minutes."), "text/html; charset=utf-8")
+            u = db.get_user(name) if name else None
+            ok = auth.verify_password(pw, u["pw_hash"] if u else auth.DUMMY)  # always hash, so timing doesn't reveal valid usernames
+            if u and ok and not u["disabled"]:
+                db.touch_login(u["username"])
+                return self.redirect("/", self.cookie_header(make_cookie(u), 30 * 86400))
+            for k in keys: fails[k].append(now)
             return self.send(401, LOGIN.replace("{{ERR}}", "Wrong username or password."), "text/html; charset=utf-8")
         if not self.authed(): return self.err("login required", 401)
         d = self.jbody()
@@ -323,7 +338,8 @@ class H(BaseHTTPRequestHandler):
             for it in items:
                 vid = video_id(it["url"])
                 if db.active_duplicate(vid, start, end, model, hint, label): dup += 1; continue
-                ids.append(db.add_job(batch, it["url"], vid, it.get("title"), start, end, model, hint, label))
+                ids.append(db.add_job(batch, it["url"], vid, it.get("title"), start, end, model, hint, label,
+                                      self.user["username"] if self.user else None))
             return self.send(200, json.dumps({"ids": ids, "queued": len(ids), "duplicates": dup}))
         if self.path == "/api/retry":
             where = "status IN ('error','cancelled')" + ("" if d.get("all_failed") else " AND id=?")
@@ -345,8 +361,8 @@ LOGIN = r"""<!doctype html><meta charset=utf-8><title>Sign in</title><meta name=
 *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f8fc;font:15px Inter,system-ui,sans-serif;color:#1b1f2e}
 form{background:#fff;border:1px solid #e4e7ee;border-radius:14px;padding:28px;width:320px}h1{font-size:20px;font-weight:600;letter-spacing:-.02em;margin:0 0 18px}
 input,button{font:inherit;width:100%;height:42px;border-radius:10px;border:1px solid #e4e7ee;padding:0 12px}input{margin-bottom:12px;outline:none}input:focus{border-color:#1f7a5c}
-button{background:#1f7a5c;color:#fff;border:0;font-weight:500;cursor:pointer}.e{color:#c8372d;font-size:13px;margin:0 0 10px}</style>
-<form method=post action=/login><h1>Podcast SRT</h1><p class=e>{{ERR}}</p><input name=username placeholder=Username autocomplete=username autofocus><input type=password name=password placeholder=Password autocomplete=current-password><button>Sign in</button></form>"""
+button{background:#1f7a5c;color:#fff;border:0;font-weight:500;cursor:pointer}.e{color:#c8372d;font-size:13px;margin:0 0 10px}.hint{color:#8a90a2;font-size:13px;margin:-8px 0 14px}.e:empty{display:none}</style>
+<form method=post action=/login><h1>Podcast SRT</h1><p class=hint>Team sign in</p><p class=e>{{ERR}}</p><input name=username placeholder=Username autocomplete=username autofocus><input type=password name=password placeholder=Password autocomplete=current-password><button>Sign in</button></form>"""
 
 
 PAGE = r"""<!doctype html><meta charset=utf-8><title>Podcast SRT</title><meta name=viewport content="width=device-width,initial-scale=1">
@@ -408,7 +424,8 @@ a.dl{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none;border
  <input id=search placeholder="Search history">
  <div class=list id=list><div class=nolist>No transcripts yet.</div></div>
  <div class=sfoot><span id=qsum>&nbsp;</span>
-  <div class=r><a href=/api/zip id=zip>Download all (.zip)</a><button class=lnk id=retryall hidden>Retry failed</button><a href=/logout id=logout hidden>Log out</a></div></div>
+  <span id=who hidden>Signed in as <b id=me></b> &middot; <a href=/logout>Log out</a></span>
+  <div class=r><a href=/api/zip id=zip>Download all (.zip)</a><button class=lnk id=retryall hidden>Retry failed</button></div></div>
 </aside>
 <main>
 <section id=pNew>
@@ -472,7 +489,7 @@ function timeUI(){ // 30 s steps for the first 10 min (short tests), then every 
  $('start').innerHTML=o;$('end').innerHTML='<option value="">End of video</option>'+o;
 }
 async function init(){
- timeUI();$('logout').hidden=!"{{AUTH}}";
+ timeUI();if("{{USER}}"){$('who').hidden=false;$('me').textContent="{{USER}}"}
  const {d:M}=await api('/api/models');
  $('model').innerHTML=M.stt.map(m=>`<option value="${m.id}">${esc(m.name)} · ${esc(m.price)}</option>`).join('');
  if(M.stt.some(m=>m.id==M.default_stt[0]))$('model').value=M.default_stt[0];
@@ -489,7 +506,7 @@ async function loadList(){
  const c=counts;$('qsum').textContent=[c.running?'1 running':'',c.queued?c.queued+' queued':'',c.done+' done',c.error?c.error+' failed':''].filter(Boolean).join(' · ');
  $('retryall').hidden=!c.error;
 }
-function sub(j){return j.status=='running'?(j.detail||'Running'):j.status=='done'?`${j.cues} lines · ${ago(j.finished_at||j.created_at)}`:j.status=='error'?'Failed':j.status=='queued'?'Queued':'Cancelled'}
+function sub(j){const by=j.created_by?' · '+j.created_by:'';return (j.status=='running'?(j.detail||'Running'):j.status=='done'?`${j.cues} lines · ${ago(j.finished_at||j.created_at)}`:j.status=='error'?'Failed':j.status=='queued'?'Queued':'Cancelled')+by}
 function renderList(){
  $('list').innerHTML=jobs.length?jobs.map(j=>`<div class="item ${sel==j.id?'on':''}" data-id="${j.id}"><span class="dot ${j.status}"></span><span><b>${esc(j.title||j.video_id||j.url)}</b><small>${esc(sub(j))}</small></span></div>`).join(''):'<div class=nolist>No transcripts yet.</div>';
  document.querySelectorAll('.item').forEach(e=>e.onclick=()=>openJob(+e.dataset.id));
@@ -502,7 +519,7 @@ async function pollJob(){
  if(j.log.length){$('log').textContent+=j.log.join('\n')+'\n';$('log').scrollTop=1e9}
  $('jtitle').textContent=j.title||j.video_id||j.url;
  const range=(j.start_s||j.end_s)?` · ${fmt(j.start_s||0)}–${j.end_s?fmt(j.end_s):'end'}`:'';
- $('jmeta').innerHTML=`<a href="${esc(j.url)}" target=_blank rel=noopener>Open on YouTube</a> · ${esc(j.model)}${range}${j.label_speakers?'':' · no speaker labels'} · added ${ago(j.created_at)}`;
+ $('jmeta').innerHTML=`<a href="${esc(j.url)}" target=_blank rel=noopener>Open on YouTube</a> · ${esc(j.model)}${range}${j.label_speakers?'':' · no speaker labels'} · added ${ago(j.created_at)}${j.created_by?' by '+esc(j.created_by):''}`;
  const live=j.status=='queued'||j.status=='running';
  $('jrun').hidden=j.status=='done';
  $('bar').style.width=(j.status=='error'?0:j.progress||0)+'%';
@@ -567,8 +584,10 @@ init();
 if __name__ == "__main__":
     host, port = os.environ.get("UI_HOST", "127.0.0.1"), int(os.environ.get("UI_PORT", 8765))
     loopback = host in ("127.0.0.1", "localhost", "::1")
-    if not loopback and not PASSWORD: sys.exit("refusing to listen on a non-loopback address without UI_PASSWORD set")
     db.init(DB_PATH)
+    REQUIRE_LOGIN = (not loopback) or os.environ.get("UI_REQUIRE_LOGIN") == "1"  # behind a proxy the app only sees loopback, so the service sets the env flag
+    if REQUIRE_LOGIN and db.count_users() == 0:
+        sys.exit("login is required but there are no users yet. Create one first:  python3 manage.py adduser NAME")
     if not os.environ.get("NO_WORKER"): threading.Thread(target=worker, daemon=True).start()
     srv = ThreadingHTTPServer((host, port), H)
     print(f"UI at http://{host}:{port}  (Ctrl+C to stop)  database {DB_PATH}")
