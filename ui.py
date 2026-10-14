@@ -3,7 +3,7 @@
 the audio (yt-dlp), transcribes it (OpenRouter) and labels the speakers -> SRT. History lives in the database (data/app.db).
 
 run:  python3 ui.py     then open http://127.0.0.1:8765
-accounts: python3 manage.py adduser NAME  (login is required once a user exists, or when UI_REQUIRE_LOGIN=1 / UI_HOST is not loopback)
+accounts: python3 manage.py adduser NAME  (only used when login is on: UI_REQUIRE_LOGIN=1 or UI_HOST not loopback; plain local runs have no login)
 env:  UI_HOST, UI_PORT, UI_REQUIRE_LOGIN, DATA_DIR, SESSION_SECRET, YT_COOKIES (cookies.txt for yt-dlp), YT_PROXY,
       KEEP_AUDIO=0 (delete the mp3 after a job), DIARIZER, DIARIZE_SHIFT, DIARIZE_THREADS
 """
@@ -22,7 +22,7 @@ import transcribe as T  # also loads .env
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get("DATA_DIR") or ROOT)
 DL, OUT, DB_PATH = DATA / "downloads", DATA / "outputs", db.default_path()
-REQUIRE_LOGIN = False  # set at startup: non-loopback host or UI_REQUIRE_LOGIN=1 (login is also on whenever a user exists)
+REQUIRE_LOGIN = False  # set at startup: non-loopback host or UI_REQUIRE_LOGIN=1; otherwise no login
 DEFAULT_STT = ["qwen/qwen3-asr-1.7b"]
 MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_MB", "2048")) * 1024 * 1024
 UP = re.compile(r"[0-9a-f]{12}\.(?:mp3|m4a|wav|mp4|mkv|webm|ogg|flac|aac|mov|opus)")  # names we generate for uploaded files
@@ -227,7 +227,7 @@ def user_from_cookie(v):
 
 
 def login_required():
-    return REQUIRE_LOGIN or db.count_users() > 0
+    return REQUIRE_LOGIN
 
 
 fails = {}  # ip -> recent failed login times
