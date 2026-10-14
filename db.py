@@ -116,12 +116,12 @@ def active_duplicate(video_id, start_s, end_s, model, speakers_hint, label_speak
 
 
 # ---------- team accounts ----------
-USERNAME = re.compile(r"[a-z0-9_-]{2,32}")
+USERNAME = re.compile(r"[a-z0-9_.@+-]{2,64}")  # plain names or email addresses
 
 
 def add_user(username, password):
     username = username.strip().lower()
-    if not USERNAME.fullmatch(username): raise ValueError("username: 2-32 characters, only a-z 0-9 _ -")
+    if not USERNAME.fullmatch(username): raise ValueError("username: 2-64 characters, only a-z 0-9 _ . @ + - (an email address works)")
     if len(password) < auth.MIN_LEN: raise ValueError(f"password must be at least {auth.MIN_LEN} characters")
     if get_user(username): raise ValueError(f"user '{username}' already exists")
     x("INSERT INTO users(username, pw_hash, created_at) VALUES(?,?,?)", (username, auth.hash_password(password), time.time()))
