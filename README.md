@@ -102,6 +102,8 @@ Update the server later with `cd /opt/transcript && git pull` (use the deploy ke
 
 ## Run it with Docker (recommended on the server)
 
+**Quick deploy:** clone the repo on the server, then `bash deploy/vps-docker.sh` (checks Docker, port and disk, asks for the OpenRouter key, creates the first login, builds, starts, prints the SSH-tunnel command). The manual steps below do the same.
+
 Self-contained: its own image and volume, nothing else on the host is touched. CPU is capped at 3 cores and 4 GB RAM in `docker-compose.yml`; change it there.
 
 ```bash
@@ -114,5 +116,5 @@ docker compose logs -f srt
 - The container refuses to start until a user exists, so it can never come up without a login. Create the user right after the first `up` (it restarts by itself until then), or run `docker compose run --rm srt python manage.py adduser NAME` first.
 - Port: published on `127.0.0.1:8765` only. nginx on the host proxies to it (`deploy/nginx.conf`). If your nginx runs in Docker, put `BIND_ADDR=172.17.0.1` in `.env` and proxy to `http://172.17.0.1:8765`; never publish it on `0.0.0.0` without the proxy and HTTPS.
 - Data (database, downloads, outputs, speaker models, yt-dlp) lives in the `srt-data` volume; yt-dlp updates itself on every start. Back up with `docker run --rm -v srt-data:/d -v "$PWD":/b alpine tar czf /b/srt-data.tgz -C /d .`
-- YouTube blocking the server: uncomment the `cookies.txt` volume line in `docker-compose.yml` and set `YT_COOKIES=/data/cookies.txt` in `.env`.
+- YouTube blocking the server ("Sign in to confirm you're not a bot" is common on datacenter IPs, and cookies are the fix): uncomment the `cookies.txt` volume line in `docker-compose.yml` and set `YT_COOKIES=/data/cookies.txt` in `.env`.
 - Update: `git pull && docker compose up -d --build`. Team commands: `docker compose exec srt python manage.py listusers|passwd|disable|enable|deluser NAME`.
