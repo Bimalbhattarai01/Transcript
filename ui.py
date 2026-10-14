@@ -468,7 +468,7 @@ aside .ghost{width:100%;height:38px;background:#fff;color:var(--ink);border:1px 
 .nolist{color:var(--mut);font-size:13px;padding:16px 8px}
 .sfoot{border-top:1px solid var(--line);padding-top:12px;font-size:12.5px;color:var(--mut);display:flex;flex-direction:column;gap:8px}
 .sfoot .r{display:flex;gap:12px;flex-wrap:wrap}.sfoot a,.sfoot button.lnk{color:var(--sub);background:none;border:0;padding:0;height:auto;font-size:12.5px;cursor:pointer;text-decoration:underline}
-main{padding:0 44px 70px;max-width:1240px;width:100%}
+main{padding:0 44px 70px;width:100%;min-width:0}
 .topbar{display:flex;justify-content:flex-end;align-items:center;height:64px;position:relative}
 .menu{position:relative}
 .user{height:38px;padding:0 10px 0 5px;gap:9px;display:flex;align-items:center;background:#fff;color:var(--ink);border:1px solid var(--line);border-radius:999px;font-size:13.5px;font-weight:500}.user:hover{background:#f5f6fa}
