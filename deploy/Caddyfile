@@ -1,0 +1,5 @@
+# Replace the hostname with your own domain (its DNS A record must point at this server). Caddy gets the HTTPS certificate itself.
+srt.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8765
+}

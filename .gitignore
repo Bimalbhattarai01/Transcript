@@ -13,3 +13,6 @@ bin/
 *.zip
 comparision/
 test/
+models/
+data/
+cookies.txt

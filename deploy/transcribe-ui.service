@@ -1,0 +1,21 @@
+[Unit]
+Description=Podcast SRT web UI and queue worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=srt
+WorkingDirectory=/opt/transcript
+EnvironmentFile=/opt/transcript/.env
+Environment=UI_HOST=127.0.0.1 UI_PORT=8765 NO_BROWSER=1 KEEP_AUDIO=0 DIARIZER=fast DIARIZE_THREADS=3
+ExecStart=/opt/transcript/.venv/bin/python ui.py
+Restart=always
+RestartSec=5
+# this server runs other services: keep the batch from starving them
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=300%
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target
