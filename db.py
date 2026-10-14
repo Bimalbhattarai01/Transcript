@@ -1,6 +1,9 @@
 """Tiny SQLite layer for the web UI: a job queue + history. One connection guarded by a lock (WAL mode)."""
-import sqlite3, threading, time
+import os, re, sqlite3, threading, time
 from pathlib import Path
+
+import auth
+from env import load_env
 
 _lock = threading.RLock()
 _conn = None
@@ -17,9 +20,18 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at REAL, started_at REAL, finished_at REAL);
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS jobs_video ON jobs(video_id);
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE, pw_hash TEXT NOT NULL,
+    disabled INTEGER NOT NULL DEFAULT 0, created_at REAL, last_login REAL);
 """
 LIST_COLS = ("id, batch_id, url, video_id, title, status, stage, progress, detail, start_s, end_s, model, label_speakers, "
-             "cost, seconds, cues, words, error, created_at, started_at, finished_at")
+             "cost, seconds, cues, words, error, created_by, created_at, started_at, finished_at")
+
+
+def default_path():
+    """data/app.db under DATA_DIR (default: the repo folder); the server and manage.py must agree on it."""
+    load_env()
+    return Path(os.environ.get("DATA_DIR") or Path(__file__).parent) / "data" / "app.db"
 
 
 def init(path):
@@ -30,6 +42,8 @@ def init(path):
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL"); _conn.execute("PRAGMA busy_timeout=5000")
         _conn.executescript(SCHEMA)
+        if "created_by" not in {r[1] for r in _conn.execute("PRAGMA table_info(jobs)")}:  # databases made before accounts existed
+            _conn.execute("ALTER TABLE jobs ADD COLUMN created_by TEXT")
         # a crash/restart mid-job: put it back in the queue (chunk + diarization caches make the retry cheap)
         _conn.execute("UPDATE jobs SET status='queued', stage='queued', progress=0, detail='' WHERE status='running'")
 
@@ -48,10 +62,10 @@ def add_batch(name):
     return x("INSERT INTO batches(name, created_at) VALUES(?,?)", (name, time.time()))
 
 
-def add_job(batch_id, url, video_id, title, start_s, end_s, model, speakers_hint, label_speakers):
-    return x("INSERT INTO jobs(batch_id,url,video_id,title,start_s,end_s,model,speakers_hint,label_speakers,created_at) "
-             "VALUES(?,?,?,?,?,?,?,?,?,?)",
-             (batch_id, url, video_id, title, start_s, end_s, model, speakers_hint, int(bool(label_speakers)), time.time()))
+def add_job(batch_id, url, video_id, title, start_s, end_s, model, speakers_hint, label_speakers, created_by=None):
+    return x("INSERT INTO jobs(batch_id,url,video_id,title,start_s,end_s,model,speakers_hint,label_speakers,created_by,created_at) "
+             "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+             (batch_id, url, video_id, title, start_s, end_s, model, speakers_hint, int(bool(label_speakers)), created_by, time.time()))
 
 
 def get(jid, cols="*"):
@@ -99,3 +113,48 @@ def active_duplicate(video_id, start_s, end_s, model, speakers_hint, label_speak
           "AND model=? AND speakers_hint=? AND label_speakers=? LIMIT 1",
           (video_id, start_s, end_s, model, speakers_hint, int(bool(label_speakers))))
     return r[0]["id"] if r else None
+
+
+# ---------- team accounts ----------
+USERNAME = re.compile(r"[a-z0-9_-]{2,32}")
+
+
+def add_user(username, password):
+    username = username.strip().lower()
+    if not USERNAME.fullmatch(username): raise ValueError("username: 2-32 characters, only a-z 0-9 _ -")
+    if len(password) < auth.MIN_LEN: raise ValueError(f"password must be at least {auth.MIN_LEN} characters")
+    if get_user(username): raise ValueError(f"user '{username}' already exists")
+    x("INSERT INTO users(username, pw_hash, created_at) VALUES(?,?,?)", (username, auth.hash_password(password), time.time()))
+
+
+def get_user(username):
+    r = q("SELECT * FROM users WHERE username=?", (username.strip().lower(),))
+    return r[0] if r else None
+
+
+def set_password(username, password):
+    if len(password) < auth.MIN_LEN: raise ValueError(f"password must be at least {auth.MIN_LEN} characters")
+    if not get_user(username): raise ValueError(f"no such user '{username}'")
+    x("UPDATE users SET pw_hash=? WHERE username=?", (auth.hash_password(password), username.strip().lower()))
+
+
+def set_disabled(username, disabled):
+    if not get_user(username): raise ValueError(f"no such user '{username}'")
+    x("UPDATE users SET disabled=? WHERE username=?", (int(disabled), username.strip().lower()))
+
+
+def delete_user(username):
+    if not get_user(username): raise ValueError(f"no such user '{username}'")
+    x("DELETE FROM users WHERE username=?", (username.strip().lower(),))
+
+
+def list_users():
+    return q("SELECT username, disabled, created_at, last_login FROM users ORDER BY username")
+
+
+def touch_login(username):
+    x("UPDATE users SET last_login=? WHERE username=?", (time.time(), username))
+
+
+def count_users():
+    return q("SELECT COUNT(*) n FROM users")[0]["n"]
