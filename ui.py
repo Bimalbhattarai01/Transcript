@@ -371,8 +371,8 @@ label{display:block;font-size:13px;font-weight:500;color:var(--sub);margin:0 0 6
 .field{position:relative;margin-bottom:16px}
 input{font:inherit;font-size:14.5px;width:100%;height:44px;padding:0 12px;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink);outline:none;transition:border-color .12s,box-shadow .12s}
 input::placeholder{color:#b0b5c3}input:focus{border-color:var(--g);box-shadow:0 0 0 3px #1f7a5c1a}
-.field input[type=password],.field input.pw{padding-right:62px}
-.eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);height:32px;width:auto;padding:0 10px;border:0;background:none;color:var(--sub);font:inherit;font-size:12.5px;font-weight:500;cursor:pointer;border-radius:8px}.eye:hover{background:#f1f2f8}
+.pw{position:relative}.pw input{padding-right:46px}
+.eye{position:absolute;right:5px;top:5px;width:34px;height:34px;padding:0;border:0;background:none;color:#8a90a2;cursor:pointer;border-radius:8px;display:grid;place-items:center}.eye:hover{background:#f1f2f8;color:var(--ink)}.eye svg{width:18px;height:18px;display:block}.eye .off{display:none}.eye.on .off{display:block}.eye.on .see{display:none}
 .go{font:inherit;font-size:14.5px;font-weight:500;width:100%;height:46px;border:0;border-radius:10px;background:var(--g);color:#fff;cursor:pointer;margin-top:6px;transition:background .12s}
 .go:hover{background:#196a4f}.go:disabled{opacity:.6;cursor:default}
 .e{background:#fdf0ef;color:#b3302a;font-size:13px;border-radius:9px;padding:9px 12px;margin:0 0 16px}.e:empty{display:none}
@@ -386,7 +386,11 @@ input::placeholder{color:#b0b5c3}input:focus{border-color:var(--g);box-shadow:0 
   <h2>Sign in</h2><p class=hint>Use the email or username your admin gave you.</p>
   <p class=e role=alert>{{ERR}}</p>
   <div class=field><label for=u>Email or username</label><input id=u name=username autocomplete=username autocapitalize=off spellcheck=false autofocus required></div>
-  <div class=field><label for=p>Password</label><input id=p type=password name=password autocomplete=current-password required><button type=button class=eye id=eye>Show</button></div>
+  <div class=field><label for=p>Password</label><div class=pw><input id=p type=password name=password autocomplete=current-password required>
+   <button type=button class=eye id=eye aria-label="Show password" title="Show password">
+    <svg class=see viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round stroke-linejoin=round><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx=12 cy=12 r=3 /></svg>
+    <svg class=off viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round stroke-linejoin=round><path d="M17.9 17.9A10.4 10.4 0 0 1 12 19c-6.4 0-10-7-10-7a18.3 18.3 0 0 1 4.1-5M9.9 5.2A9.7 9.7 0 0 1 12 5c6.4 0 10 7 10 7a18.3 18.3 0 0 1-2.2 3.2M1 1l22 22M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>
+   </button></div></div>
   <div class=caps id=caps>Caps Lock is on</div>
   <button class=go id=go>Sign in</button>
   <p class=foot>No account? Ask the person who runs this server to add you.</p>
@@ -394,7 +398,7 @@ input::placeholder{color:#b0b5c3}input:focus{border-color:var(--g);box-shadow:0 
 </div>
 <script>
 const p=document.getElementById('p'),eye=document.getElementById('eye');
-eye.onclick=()=>{const show=p.type=='password';p.type=show?'text':'password';eye.textContent=show?'Hide':'Show'};
+eye.onclick=()=>{const show=p.type=='password';p.type=show?'text':'password';eye.classList.toggle('on',show);const t=show?'Hide password':'Show password';eye.setAttribute('aria-label',t);eye.title=t;p.focus()};
 p.addEventListener('keyup',e=>{document.getElementById('caps').style.display=e.getModifierState&&e.getModifierState('CapsLock')?'block':'none'});
 document.getElementById('f').addEventListener('submit',()=>{const b=document.getElementById('go');b.disabled=true;b.textContent='Signing in...'});
 </script>"""
