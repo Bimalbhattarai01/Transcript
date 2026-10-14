@@ -1,31 +1,30 @@
 #!/usr/bin/env python3
-"""Local web UI: paste a YouTube link -> download audio (yt-dlp) -> transcribe with one or MORE models -> SRT
-(optionally translated to English), with live progress, prices and a side-by-side model comparison.
+"""Web UI + job queue: paste YouTube links (one, many, or a playlist/channel) -> jobs are queued in SQLite -> a worker downloads
+the audio (yt-dlp), transcribes it (OpenRouter) and labels the speakers -> SRT. History lives in the database (data/app.db).
 
 run:  python3 ui.py     then open http://127.0.0.1:8765
+env:  UI_PASSWORD (required when UI_HOST is not a loopback address), UI_HOST, UI_PORT, DATA_DIR, SESSION_SECRET,
+      YT_COOKIES (cookies.txt for yt-dlp), YT_PROXY, KEEP_AUDIO=0 (delete the mp3 after a job), DIARIZER, DIARIZE_SHIFT
 """
-import json, os, re, subprocess, threading, time, uuid, webbrowser
+import hashlib, hmac, io, json, os, re, secrets, subprocess, sys, threading, time, traceback, webbrowser, zipfile
 from argparse import Namespace
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
-import transcribe as T
-import translate as TR
+import db
+import transcribe as T  # also loads .env
 
 ROOT = Path(__file__).parent
-DL, OUT = ROOT / "downloads", ROOT / "outputs"
-jobs, run_lock = {}, threading.Lock()  # one job at a time (transcribe hooks are global)
-EPISODE_TOKENS = (40_000, 30_000)  # rough in/out tokens to translate a ~1.5h episode
-TR_CHOICES = ["google/gemini-3.8-flash", "google/gemini-3.5-flash-lite", "openai/gpt-5.6-luna", "openai/gpt-5.6-terra",
-              "anthropic/claude-sonnet-5.5"]
-DEFAULT_STT = ["openai/gpt-transcribe"]
+DATA = Path(os.environ.get("DATA_DIR") or ROOT)
+DL, OUT, DB_PATH = DATA / "downloads", DATA / "outputs", DATA / "data" / "app.db"
+PASSWORD = os.environ.get("UI_PASSWORD") or ""
+USER = os.environ.get("UI_USER") or "admin"
+DEFAULT_STT = ["qwen/qwen3-asr-1.7b"]
+YT = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/")
 _models = {"t": 0, "data": None}
-
-
-def add(job, msg):
-    job["log"].append(msg)
 
 
 # ---------- model list with prices (live from OpenRouter, no key needed) ----------
@@ -38,157 +37,171 @@ def stt_price(m):
 
 def get_models():
     if _models["data"] and time.time() - _models["t"] < 600: return _models["data"]
-    stt, tr = [], []
+    stt = []
     try:
-        base = "https://openrouter.ai/api/v1/models"
-        for m in requests.get(base + "?output_modalities=transcription", timeout=15).json()["data"]:
-            stt.append({"id": m["id"], "name": m["name"], "price": stt_price(m)})
-        by_id = {m["id"]: m for m in requests.get(base, timeout=15).json()["data"]}
-        for i in TR_CHOICES:
-            if i in by_id:
-                pi, po = float(by_id[i]["pricing"]["prompt"]), float(by_id[i]["pricing"]["completion"])
-                est = pi * EPISODE_TOKENS[0] + po * EPISODE_TOKENS[1]
-                tr.append({"id": i, "name": by_id[i]["name"], "price": f"${pi*1e6:.2f}/M in, ${po*1e6:.2f}/M out", "est": f"~${est:.2f}/episode"})
+        r = requests.get("https://openrouter.ai/api/v1/models?output_modalities=transcription", timeout=15).json()["data"]
+        stt = [{"id": m["id"], "name": m["name"], "price": stt_price(m)} for m in r]
     except Exception as e:
         print("model list failed:", e)
     if not stt: stt = [{"id": i, "name": i, "price": "?"} for i in DEFAULT_STT]
-    if not tr: tr = [{"id": TR.DEFAULT_MODEL, "name": TR.DEFAULT_MODEL, "price": "?", "est": ""}]
-    _models.update(t=time.time(), data={"stt": stt, "tr": tr, "default_stt": DEFAULT_STT, "default_tr": TR.DEFAULT_MODEL})
+    _models.update(t=time.time(), data={"stt": stt, "default_stt": DEFAULT_STT})
     return _models["data"]
 
 
-# ---------- jobs ----------
-def do_translate(job, r, model):
-    job.update(stage="translate", progress=0, detail=f"{r['model']} -> English")
-    dst, c = TR.translate_srt(r["srt"], model=model, key=os.environ.get("OPENROUTER_API_KEY"), log=lambda m: add(job, m),
-                              progress=lambda d, t: job.update(progress=100 * d / t, detail=f"English {d}/{t} batches"))
-    r.update(en_srt=str(dst), en_text=Path(dst).read_text(encoding="utf-8"), en_model=model, en_cost=round(c, 4))
+# ---------- yt-dlp helpers ----------
+def video_id(url):
+    m = re.search(r"(?:youtu\.be/|[?&]v=|/shorts/|/live/)([\w-]{11})", url)
+    return m.group(1) if m else None
 
 
-def run_translate(job, r, model):
-    with run_lock:
-        try:
-            do_translate(job, r, model)
-        except (Exception, SystemExit) as e:
-            add(job, f"TRANSLATE ERROR: {e}")
-        finally:
-            job.update(stage="done", progress=100, status="done")
+def ytdlp_cmd():
+    exe = str(ROOT / "bin" / "yt-dlp") if (ROOT / "bin" / "yt-dlp").exists() else "yt-dlp"
+    cmd = [exe, "--js-runtimes", "node", "--remote-components", "ejs:github"]  # YouTube needs a JS runtime (node) + fresh yt-dlp
+    if os.environ.get("YT_COOKIES"): cmd += ["--cookies", os.environ["YT_COOKIES"]]  # datacenter IPs are often asked to prove they're human
+    if os.environ.get("YT_PROXY"): cmd += ["--proxy", os.environ["YT_PROXY"]]
+    return cmd
 
 
-def download(job, url):
-    job.update(stage="download", progress=0)
-    add(job, "Downloading audio with yt-dlp...")
-    ytdlp = str(ROOT / "bin" / "yt-dlp") if (ROOT / "bin" / "yt-dlp").exists() else "yt-dlp"
-    # YouTube needs a JS runtime (node) + fresh yt-dlp, else 403
-    p = subprocess.Popen([ytdlp, "--js-runtimes", "node", "--remote-components", "ejs:github", "--no-playlist", "--newline",
-                          "-f", "bestaudio", "-x", "--audio-format", "mp3", "--print", "after_move:filepath",
-                          "-o", str(DL / "%(id)s.%(ext)s"), url], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+def is_playlist(url):
+    return "youtube.com/playlist" in url or bool(re.search(r"youtube\.com/(@[^/?]+|channel/[^/?]+|c/[^/?]+|user/[^/?]+)", url))
+
+
+def expand_playlist(url):
+    if re.search(r"youtube\.com/(@[^/?]+|channel/[^/?]+|c/[^/?]+|user/[^/?]+)/?$", url): url = url.rstrip("/") + "/videos"
+    p = subprocess.run(ytdlp_cmd() + ["--flat-playlist", "--dump-single-json", url], capture_output=True, text=True, timeout=300)
+    if p.returncode: raise RuntimeError(((p.stderr or "yt-dlp failed").strip().splitlines() or ["yt-dlp failed"])[-1][:200])
+
+    def walk(e):
+        for x in e.get("entries") or []:
+            if x.get("entries"): yield from walk(x)
+            elif x.get("id"): yield {"id": x["id"], "title": x.get("title"), "url": f"https://www.youtube.com/watch?v={x['id']}"}
+    return list(walk(json.loads(p.stdout)))
+
+
+def oembed_title(url):
+    try:
+        return requests.get("https://www.youtube.com/oembed", params={"url": url, "format": "json"}, timeout=8).json().get("title")
+    except Exception:
+        return None
+
+
+# ---------- the worker ----------
+class JobIO:
+    """Writes a running job's log lines and progress into the database (progress writes are throttled)."""
+    def __init__(self, jid): self.jid, self.t = jid, 0.0
+
+    def log(self, msg): db.append_log(self.jid, str(msg))
+
+    def set(self, force=False, **kw):
+        if force or time.time() - self.t > 0.7:
+            self.t = time.time(); db.update(self.jid, **kw)
+
+
+def download(io, url, vid):
+    if vid and (DL / f"{vid}.mp3").exists():  # same video again: skip the download
+        io.log(f"Using cached audio {vid}.mp3")
+        return str(DL / f"{vid}.mp3")
+    io.log("Downloading audio with yt-dlp...")
+    p = subprocess.Popen(ytdlp_cmd() + ["--no-playlist", "--newline", "-f", "bestaudio", "-x", "--audio-format", "mp3",
+                                        "--print", "after_move:filepath", "-o", str(DL / "%(id)s.%(ext)s"), url],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     path = None
     for line in p.stdout:
         line = line.strip()
         if m := re.search(r"\[download\]\s+([\d.]+)%", line):
-            job["progress"] = float(m[1])
+            io.set(progress=float(m[1]), detail=f"Downloading audio {float(m[1]):.0f}%")
         elif line.startswith("/") and line.endswith(".mp3"):
             path = line
-        elif line:
-            add(job, line)
+        elif line and not line.startswith("[download]"):
+            io.log(line)
     if p.wait() != 0 or not path: raise RuntimeError("yt-dlp failed (see log)")
-    add(job, f"Downloaded {Path(path).name}")
+    io.log(f"Downloaded {Path(path).name}")
     return path
 
 
-def run_job(job, url, start, limit, models, want_en, en_model, clean=False):
-    with run_lock:
+def run_one(j):
+    jid = j["id"]; io = JobIO(jid)
+    db.update(jid, status="running", stage="download", progress=0, detail="Starting", started_at=time.time(), error=None)
+    try:
+        key = os.environ.get("OPENROUTER_API_KEY")
+        if not key: raise RuntimeError("OPENROUTER_API_KEY missing in .env")
+        if not j["title"]:
+            t = oembed_title(j["url"])
+            if t: db.update(jid, title=t)
+        prior = db.find_done(j["video_id"], j["start_s"], j["end_s"], j["model"], j["speakers_hint"], j["label_speakers"], jid)
+        if prior:
+            io.log(f"Reused the finished result of job #{prior['id']} (same video, range and settings)")
+            db.update(jid, status="done", stage="done", progress=100, detail="", srt_text=prior["srt_text"], cost=0, seconds=0,
+                      cues=prior["cues"], words=prior["words"], finished_at=time.time())
+            return
+        DL.mkdir(parents=True, exist_ok=True); OUT.mkdir(parents=True, exist_ok=True)
+        db.update(jid, detail="Downloading audio")
+        path = download(io, j["url"], j["video_id"])
+        io.set(True, stage="transcribe", progress=0, detail="Transcribing")
+        T.hooks["log"] = io.log
+        T.hooks["progress"] = lambda d, t: io.set(progress=100 * d / t, detail=f"Transcribing {d}/{t} chunks")
+        limit = j["end_s"] - j["start_s"] if j["end_s"] else None
+        tag = j["model"].replace("/", "_")
+        a = Namespace(out=str(OUT), model=j["model"], lang="en", workers=6, max_chunk=20, soft_chunk=10, noise_db=-35, min_silence=0.35,
+                      start=j["start_s"], limit_seconds=limit, compare=None, glossary=None, force=True, tag=tag,
+                      speakers=j["speakers_hint"] or "" if j["label_speakers"] else None)
+        c0, t0 = T.state["cost"], time.time()
+        if not T.process(path, a, key, []): raise RuntimeError("transcription failed (see log)")
+        srt = OUT / (Path(path).stem + f".{tag}" + (".test" if limit else "") + ".srt")
+        text = srt.read_text(encoding="utf-8")
+        db.update(jid, status="done", stage="done", progress=100, detail="", srt_text=text, cost=round(T.state["cost"] - c0, 4),
+                  seconds=round(time.time() - t0), cues=text.count("-->"), words=len(text.split()), finished_at=time.time())
+        if os.environ.get("KEEP_AUDIO", "1") == "0" and not db.q("SELECT 1 FROM jobs WHERE video_id=? AND status='queued'", (j["video_id"],)):
+            Path(path).unlink(missing_ok=True)  # save disk on a server that processes hundreds of episodes
+    except (Exception, SystemExit) as e:  # SystemExit: fatal API errors (bad key, no credits)
+        io.log(f"ERROR: {e}")
+        db.update(jid, status="error", stage="error", error=str(e)[:300], finished_at=time.time())
+    finally:
+        T.hooks["log"] = print; T.hooks["progress"] = lambda d, t: None
+
+
+def worker():
+    while True:
         try:
-            key = os.environ.get("OPENROUTER_API_KEY")
-            if not key: raise RuntimeError("OPENROUTER_API_KEY missing in .env")
-            DL.mkdir(exist_ok=True); OUT.mkdir(exist_ok=True)
-            path = download(job, url)
-            T.hooks["log"] = lambda m: add(job, m)
-            for n, model in enumerate(models, 1):
-                job.update(stage="transcribe", progress=0, detail=f"{model} ({n}/{len(models)})")
-                add(job, f"=== {model} ===")
-                T.hooks["progress"] = lambda d, t, n=n, model=model: job.update(
-                    progress=100 * d / t, detail=f"{model} ({n}/{len(models)}) {d}/{t} chunks")
-                tag = model.replace("/", "_")
-                a = Namespace(out=str(OUT), model=model, lang="ne", workers=6, max_chunk=20, soft_chunk=10, noise_db=-35,
-                              min_silence=0.35, start=start, limit_seconds=limit, compare=None, glossary=None, force=True, tag=tag)
-                c0, t0 = T.state["cost"], time.time()
-                try:
-                    if not T.process(path, a, key, []): raise RuntimeError("transcription failed (see log)")
-                except (Exception, SystemExit) as e:
-                    add(job, f"{model} FAILED: {e}")
-                    job["results"].append({"model": model, "error": str(e)[:200]}); continue
-                srt = OUT / (Path(path).stem + f".{tag}" + (".test" if limit else "") + ".srt")
-                text = srt.read_text(encoding="utf-8")
-                r = {"model": model, "srt": str(srt), "text": text, "cost": round(T.state["cost"] - c0, 4),
-                     "seconds": round(time.time() - t0), "cues": text.count("-->"), "words": len(text.split())}
-                job["results"].append(r)
-                if clean:
-                    try:
-                        job.update(stage="translate", progress=0, detail=f"{model}: English words in English letters")
-                        _, cc = TR.clean_srt(srt, model=TR.CLEAN_MODEL, key=key, log=lambda m: add(job, m),
-                                             progress=lambda d, t: job.update(progress=100 * d / t))
-                        r.update(text=srt.read_text(encoding="utf-8"), cost=round(r["cost"] + cc, 4))
-                    except (Exception, SystemExit) as e:
-                        add(job, f"CLEANUP ERROR: {e} (raw transcript kept)")
-                if want_en:
-                    try:
-                        do_translate(job, r, en_model)
-                    except (Exception, SystemExit) as e:
-                        add(job, f"TRANSLATE ERROR: {e} (Nepali SRT is still saved)")
-            ok = any("srt" in r for r in job["results"])
-            job.update(stage="done" if ok else "error", status="done" if ok else "error", progress=100)
-        except (Exception, SystemExit) as e:  # SystemExit: fatal API errors (bad key, no credits)
-            add(job, f"ERROR: {e}"); job.update(status="error", stage="error")
-        finally:
-            T.hooks["log"] = print; T.hooks["progress"] = lambda d, t: None
+            j = db.next_queued()
+            if not j: time.sleep(1.5); continue
+            run_one(j)
+        except Exception:
+            traceback.print_exc(); time.sleep(3)
 
 
-def run_existing(job, path, clean, want_en, en_model):
-    """Clean and/or translate an SRT that is already in outputs/ (no download, no transcription cost)."""
-    path = Path(path)
-    r = {"model": path.name, "srt": str(path), "cost": 0.0, "seconds": 0}
-    with run_lock:
-        try:
-            key = os.environ.get("OPENROUTER_API_KEY")
-            if not key: raise RuntimeError("OPENROUTER_API_KEY missing in .env")
-            job["results"].append(r)
-            t0 = time.time()
-            if clean:
-                job.update(stage="translate", progress=0, detail="English words in English letters")
-                _, c = TR.clean_srt(path, model=TR.CLEAN_MODEL, key=key, log=lambda m: add(job, m),
-                                    progress=lambda d, t: job.update(progress=100 * d / t, detail=f"cleanup {d}/{t} batches"))
-                r["cost"] = round(r["cost"] + c, 4)
-            text = path.read_text(encoding="utf-8")
-            r.update(text=text, cues=text.count("-->"), words=len(text.split()))
-            if want_en:
-                do_translate(job, r, en_model)
-                r["cost"] = round(r["cost"] + r.get("en_cost", 0), 4)
-            r["seconds"] = round(time.time() - t0)
-            job.update(stage="done", status="done", progress=100)
-        except (Exception, SystemExit) as e:
-            add(job, f"ERROR: {e}")
-            if "text" in r:
-                job.update(stage="done", status="done")  # partial result still usable
-            else:
-                if r in job["results"]: job["results"].remove(r)
-                job.update(status="error", stage="error")
+# ---------- auth (single shared password, signed cookie) ----------
+def _secret():
+    s = os.environ.get("SESSION_SECRET")
+    if s: return s.encode()
+    f = DB_PATH.parent / ".session_secret"
+    if not f.exists():
+        f.parent.mkdir(parents=True, exist_ok=True); f.write_text(secrets.token_hex(32)); f.chmod(0o600)
+    return f.read_text().strip().encode()
 
 
-def list_srts():
-    out = []
-    files = sorted(OUT.glob("*.srt"), key=lambda f: -f.stat().st_mtime) if OUT.exists() else []
-    for f in files:
-        if f.name.endswith((".en.srt", ".raw.srt")): continue
-        t = f.read_text(encoding="utf-8")
-        dev = sum(1 for blk in t.split("\n\n") if any("\u0900" <= ch <= "\u097f" for ch in blk))
-        out.append({"name": f.name, "cues": t.count("-->"), "nepali_cues": dev, "has_en": f.with_suffix(".en.srt").exists()})
-    return out
+def _sig(exp):  # bound to the user AND the password: changing either (or SESSION_SECRET) logs everyone out
+    return hmac.new(_secret(), f"{exp}|{USER}|{PASSWORD}".encode(), hashlib.sha256).hexdigest()
 
 
-def result_meta(r):
-    return {k: v for k, v in r.items() if k not in ("text", "en_text")} | {"has_en": "en_text" in r}
+def make_cookie():
+    exp = str(int(time.time()) + 30 * 86400)
+    return f"{exp}.{_sig(exp)}"
+
+
+def valid_cookie(v):
+    try:
+        exp, sig = v.split(".")
+        return int(exp) > time.time() and hmac.compare_digest(sig, _sig(exp))
+    except Exception:
+        return False
+
+
+fails = {}  # ip -> recent failed login times
+
+
+def safe_name(s):
+    return re.sub(r"[^\w\-. ()\[\]]+", "_", s or "transcript").strip(" ._")[:90] or "transcript"
 
 
 class H(BaseHTTPRequestHandler):
@@ -200,186 +213,364 @@ class H(BaseHTTPRequestHandler):
         for k, v in (extra or {}).items(): self.send_header(k, v)
         self.end_headers(); self.wfile.write(b)
 
+    def redirect(self, to, extra=None):
+        self.send(302, "", "text/plain", {"Location": to, **(extra or {})})
+
+    def ip(self):
+        return (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+
+    def authed(self):
+        if not PASSWORD: return True
+        c = SimpleCookie(self.headers.get("Cookie") or "")
+        return "sess" in c and valid_cookie(c["sess"].value)
+
+    def cookie_header(self, value, max_age):
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+        return {"Set-Cookie": f"sess={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{secure}"}
+
+    def body(self):
+        n = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(n) if n else b""
+
+    def jbody(self):
+        try: return json.loads(self.body() or "{}")
+        except ValueError: return {}
+
+    def err(self, msg, code=400):
+        return self.send(code, json.dumps({"error": msg}))
+
+    # ---------- GET ----------
     def do_GET(self):
-        u = urlparse(self.path); parts = u.path.strip("/").split("/")
-        if u.path == "/": return self.send(200, PAGE, "text/html; charset=utf-8")
-        if u.path == "/api/srts": return self.send(200, json.dumps(list_srts()))
+        u = urlparse(self.path); parts = u.path.strip("/").split("/"); qs = parse_qs(u.query)
+        if u.path == "/static/Inter.woff2" and (ROOT / "static" / "Inter.woff2").exists():
+            return self.send(200, (ROOT / "static" / "Inter.woff2").read_bytes(), "font/woff2", {"Cache-Control": "max-age=31536000"})
+        if u.path == "/login": return self.send(200, LOGIN.replace("{{ERR}}", ""), "text/html; charset=utf-8") if PASSWORD else self.redirect("/")
+        if u.path == "/logout": return self.redirect("/login", self.cookie_header("", 0))
+        if not self.authed():
+            return self.err("login required", 401) if u.path.startswith("/api/") else self.redirect("/login")
+        if u.path == "/": return self.send(200, PAGE.replace("{{AUTH}}", "1" if PASSWORD else ""), "text/html; charset=utf-8")
         if u.path == "/api/models": return self.send(200, json.dumps(get_models()))
-        if parts[:2] == ["api", "job"] and len(parts) == 3 and parts[2] in jobs:
-            j = jobs[parts[2]]; frm = int(parse_qs(u.query).get("from", ["0"])[0])
-            body = {k: v for k, v in j.items() if k not in ("log", "results")}
-            return self.send(200, json.dumps({**body, "log": j["log"][frm:], "next": len(j["log"]),
-                                              "results": [result_meta(r) for r in j["results"]]}))
-        if parts[:2] == ["api", "result"] and len(parts) == 4 and parts[2] in jobs:  # text of one result
-            try: r = jobs[parts[2]]["results"][int(parts[3])]
-            except (ValueError, IndexError): return self.send(404, "{}")
-            return self.send(200, json.dumps({"text": r.get("text", ""), "en_text": r.get("en_text", "")}))
-        if parts[:2] == ["api", "file"] and len(parts) == 4 and parts[2] in jobs:
-            try: r = jobs[parts[2]]["results"][int(parts[3])]
-            except (ValueError, IndexError): return self.send(404, "{}")
-            en = bool(parse_qs(u.query).get("en")) and "en_text" in r
-            return self.send(200, r["en_text"] if en else r["text"], "application/x-subrip; charset=utf-8",
-                             {"Content-Disposition": f'attachment; filename="{Path(r["en_srt"] if en else r["srt"]).name}"'})
+        if u.path == "/api/jobs":
+            return self.send(200, json.dumps({"jobs": db.list_jobs((qs.get("q") or [""])[0].strip()), "counts": db.counts()}))
+        if parts[:2] == ["api", "job"] and len(parts) == 3 and parts[2].isdigit():
+            j = db.get(int(parts[2]), db.LIST_COLS + ", speakers_hint, log")
+            if not j: return self.send(404, "{}")
+            frm = int((qs.get("from") or ["0"])[0]); lines = j.pop("log").splitlines()
+            return self.send(200, json.dumps({**j, "log": lines[frm:], "next": len(lines)}))
+        if parts[:2] == ["api", "result"] and len(parts) == 3 and parts[2].isdigit():
+            j = db.get(int(parts[2]), "srt_text")
+            return self.send(200, json.dumps({"text": (j or {}).get("srt_text") or ""}))
+        if parts[:2] == ["api", "file"] and len(parts) == 3 and parts[2].isdigit():
+            j = db.get(int(parts[2]), "id, title, video_id, srt_text")
+            if not j or not j["srt_text"]: return self.send(404, "{}")
+            name = safe_name(j["title"] or j["video_id"]) + ".srt"
+            return self.send(200, j["srt_text"], "application/x-subrip; charset=utf-8",
+                             {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"})
+        if u.path == "/api/zip":
+            ids = [int(i) for i in (qs.get("ids") or [""])[0].split(",") if i.isdigit()]
+            rows = db.q("SELECT id, title, video_id, srt_text FROM jobs WHERE status='done' AND srt_text IS NOT NULL ORDER BY id")
+            rows = [r for r in rows if not ids or r["id"] in ids]
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for r in rows: z.writestr(f"{safe_name(r['title'] or r['video_id'])} [{r['id']}].srt", r["srt_text"])
+            return self.send(200, buf.getvalue(), "application/zip", {"Content-Disposition": 'attachment; filename="transcripts.zip"'})
         self.send(404, "{}")
 
+    # ---------- POST ----------
     def do_POST(self):
-        d = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or "{}")
-        if self.path == "/api/translate":
-            j = jobs.get(d.get("id"))
-            try: r = j["results"][int(d.get("idx", 0))]
-            except (TypeError, KeyError, ValueError, IndexError): r = None
-            if not j or j.get("status") == "running" or not r or "srt" not in r:
-                return self.send(400, json.dumps({"error": "no finished result"}))
-            j.update(status="running", want_en=True)
-            threading.Thread(target=run_translate, args=(j, r, d.get("en_model") or TR.DEFAULT_MODEL), daemon=True).start()
+        if self.path == "/login":
+            ip, now = self.ip(), time.time()
+            fails[ip] = [t for t in fails.get(ip, []) if now - t < 300]
+            if len(fails[ip]) >= 5:
+                return self.send(429, LOGIN.replace("{{ERR}}", "Too many attempts. Wait a few minutes."), "text/html; charset=utf-8")
+            form = parse_qs(self.body().decode())
+            user, pw = (form.get("username") or [""])[0].strip(), (form.get("password") or [""])[0]
+            ok_user = hmac.compare_digest(user.encode(), USER.encode())  # evaluate both so timing doesn't reveal which was wrong
+            ok_pw = hmac.compare_digest(pw.encode(), PASSWORD.encode())
+            if PASSWORD and ok_user and ok_pw:
+                return self.redirect("/", self.cookie_header(make_cookie(), 30 * 86400))
+            fails[ip].append(now)
+            return self.send(401, LOGIN.replace("{{ERR}}", "Wrong username or password."), "text/html; charset=utf-8")
+        if not self.authed(): return self.err("login required", 401)
+        d = self.jbody()
+        if self.path == "/api/expand":
+            items, skipped, expanded, seen = [], [], False, set()
+            for url in re.findall(r"https?://\S+", d.get("text") or ""):
+                try:
+                    if is_playlist(url) and not re.search(r"[?&]v=", url): found = expand_playlist(url); expanded = True
+                    elif YT.match(url) and video_id(url): found = [{"id": video_id(url), "title": None, "url": url}]
+                    else: skipped.append(url); continue
+                except Exception as e:
+                    return self.err(f"Could not read {url}: {e}")
+                for it in found:
+                    if it["id"] not in seen: seen.add(it["id"]); items.append(it)
+            return self.send(200, json.dumps({"items": items, "expanded": expanded, "skipped": skipped}))
+        if self.path == "/api/enqueue":
+            model = d.get("model") or ""
+            if not re.fullmatch(r"[\w.\-]+/[\w.\-:]+", model): return self.err("Pick a transcription model")
+            try:
+                start = float(d.get("start") or 0)  # seconds
+                end = float(d["end"]) if d.get("end") not in (None, "") else None
+            except ValueError:
+                return self.err("Start/end must be numbers")
+            if end is not None and end <= start: return self.err("End time must be after start time")
+            hint = ",".join(n.strip() for n in (d.get("speakers") or "").split(",") if n.strip())
+            label = bool(d.get("label", True))
+            items = [it for it in (d.get("items") or []) if YT.match(it.get("url") or "") and video_id(it["url"])]
+            if not items: return self.err("Paste a valid YouTube link")
+            batch = db.add_batch(f"{len(items)} videos") if len(items) > 1 else None
+            ids, dup = [], 0
+            for it in items:
+                vid = video_id(it["url"])
+                if db.active_duplicate(vid, start, end, model, hint, label): dup += 1; continue
+                ids.append(db.add_job(batch, it["url"], vid, it.get("title"), start, end, model, hint, label))
+            return self.send(200, json.dumps({"ids": ids, "queued": len(ids), "duplicates": dup}))
+        if self.path == "/api/retry":
+            where = "status IN ('error','cancelled')" + ("" if d.get("all_failed") else " AND id=?")
+            db.x(f"UPDATE jobs SET status='queued', stage='queued', progress=0, detail='', error=NULL, srt_text=NULL WHERE {where}",
+                 () if d.get("all_failed") else (int(d.get("id") or 0),))
             return self.send(200, "{}")
-        if self.path == "/api/srt-job":
-            f = OUT / Path(d.get("file") or "").name
-            if not f.is_file() or f.suffix != ".srt": return self.send(400, json.dumps({"error": "SRT not found in outputs/"}))
-            if not (d.get("clean") or d.get("en")): return self.send(400, json.dumps({"error": "Tick cleanup and/or English"}))
-            jid = uuid.uuid4().hex[:8]
-            jobs[jid] = {"status": "running", "stage": "queued", "progress": 0, "log": [], "results": [], "want_en": True}
-            threading.Thread(target=run_existing, args=(jobs[jid], f, bool(d.get("clean")), bool(d.get("en")),
-                                                        d.get("en_model") or TR.DEFAULT_MODEL), daemon=True).start()
-            return self.send(200, json.dumps({"id": jid}))
-        if self.path != "/api/start": return self.send(404, "{}")
-        url = (d.get("url") or "").strip()
-        if not re.match(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/", url):
-            return self.send(400, json.dumps({"error": "Paste a valid YouTube link"}))
-        models = [m for m in (d.get("models") or []) if re.fullmatch(r"[\w.\-]+/[\w.\-:]+", m)]
-        if not models: return self.send(400, json.dumps({"error": "Pick at least one transcription model"}))
-        try:
-            limit = float(d["limit"]) * 60 if d.get("limit") else None
-            start = float(d.get("start") or 0) * 60
-        except ValueError:
-            return self.send(400, json.dumps({"error": "Start/limit must be numbers"}))
-        jid = uuid.uuid4().hex[:8]
-        jobs[jid] = {"status": "running", "stage": "queued", "progress": 0, "log": [], "results": [], "url": url,
-                     "want_en": bool(d.get("en") or d.get("clean"))}
-        threading.Thread(target=run_job, args=(jobs[jid], url, start, limit, models, bool(d.get("en")),
-                                               d.get("en_model") or TR.DEFAULT_MODEL, bool(d.get("clean"))), daemon=True).start()
-        self.send(200, json.dumps({"id": jid}))
+        if self.path == "/api/cancel":
+            where = "status='queued'" + ("" if d.get("all_queued") else " AND id=?")
+            db.x(f"UPDATE jobs SET status='cancelled', stage='cancelled' WHERE {where}", () if d.get("all_queued") else (int(d.get("id") or 0),))
+            return self.send(200, "{}")
+        if self.path == "/api/delete":
+            db.x("DELETE FROM jobs WHERE id=? AND status<>'running'", (int(d.get("id") or 0),))
+            return self.send(200, "{}")
+        self.send(404, "{}")
 
 
-PAGE = r"""<!doctype html><meta charset=utf-8><title>Nepali SRT</title><meta name=viewport content="width=device-width,initial-scale=1">
+LOGIN = r"""<!doctype html><meta charset=utf-8><title>Sign in</title><meta name=viewport content="width=device-width,initial-scale=1">
+<style>@font-face{font-family:Inter;src:url(/static/Inter.woff2) format("woff2");font-weight:100 900}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f8fc;font:15px Inter,system-ui,sans-serif;color:#1b1f2e}
+form{background:#fff;border:1px solid #e4e7ee;border-radius:14px;padding:28px;width:320px}h1{font-size:20px;font-weight:600;letter-spacing:-.02em;margin:0 0 18px}
+input,button{font:inherit;width:100%;height:42px;border-radius:10px;border:1px solid #e4e7ee;padding:0 12px}input{margin-bottom:12px;outline:none}input:focus{border-color:#1f7a5c}
+button{background:#1f7a5c;color:#fff;border:0;font-weight:500;cursor:pointer}.e{color:#c8372d;font-size:13px;margin:0 0 10px}</style>
+<form method=post action=/login><h1>Podcast SRT</h1><p class=e>{{ERR}}</p><input name=username placeholder=Username autocomplete=username autofocus><input type=password name=password placeholder=Password autocomplete=current-password><button>Sign in</button></form>"""
+
+
+PAGE = r"""<!doctype html><meta charset=utf-8><title>Podcast SRT</title><meta name=viewport content="width=device-width,initial-scale=1">
 <style>
-:root{color-scheme:dark}body{font:15px system-ui;background:#0f1115;color:#e6e6e6;max-width:940px;margin:32px auto;padding:0 16px}
-h1{font-size:20px}h3{margin:18px 0 8px}input,button,select{font:inherit;padding:9px 12px;border-radius:8px;border:1px solid #333;background:#181b22;color:inherit}
-input#url{width:100%;box-sizing:border-box;margin-bottom:10px}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
-input.n{width:90px}button{background:#3b6cf6;border:0;cursor:pointer}button:disabled{opacity:.5}
-.models{border:1px solid #262a33;border-radius:8px;max-height:230px;overflow:auto;margin-bottom:12px}
-.models label{display:flex;gap:10px;padding:7px 12px;border-bottom:1px solid #1d2028;cursor:pointer;align-items:baseline}
-.models label:hover{background:#171a21}.models b{font-weight:600}.models span{color:#8a93a6;font-size:13px;margin-left:auto;text-align:right}
-.steps{display:flex;gap:6px;margin:16px 0}.s{flex:1;padding:8px;border-radius:8px;background:#181b22;text-align:center;color:#777;font-size:13px}
-.s.on{background:#23325e;color:#fff}.s.ok{background:#1d3b2a;color:#9be3b0}
-.bar{height:8px;background:#181b22;border-radius:6px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:#3b6cf6;transition:width .3s}
-pre{background:#0a0c10;border:1px solid #222;border-radius:8px;padding:12px;max-height:200px;overflow:auto;font-size:12px;white-space:pre-wrap}
-textarea{width:100%;height:340px;box-sizing:border-box;background:#0a0c10;color:#e6e6e6;border:1px solid #222;border-radius:8px;padding:12px;font:14px/1.5 monospace}
-.err{color:#ff8080}small,.muted{color:#8a93a6}a.btn{background:#1f9d55;color:#fff;padding:8px 12px;border-radius:8px;text-decoration:none;font-size:14px}
-table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:10px}td,th{padding:6px 8px;border-bottom:1px solid #222;text-align:left}
-tr.pick{background:#1b2338;cursor:pointer}tr.pick:hover{background:#222c47}tr.sel{outline:1px solid #3b6cf6}
+@font-face{font-family:Inter;src:url(/static/Inter.woff2) format("woff2");font-weight:100 900;font-display:swap}
+:root{--ink:#1b1f2e;--mut:#8a90a2;--sub:#6b7186;--line:#e4e7ee;--g:#1f7a5c}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif;font-feature-settings:"cv11","ss03";-webkit-font-smoothing:antialiased;
+ background:radial-gradient(900px 380px at 25% -8%,#e8ebfb,transparent 70%),#f7f8fc}
+input,select,button,textarea{font-family:Inter,system-ui,sans-serif}
+.app{display:grid;grid-template-columns:292px 1fr;min-height:100vh}
+aside{border-right:1px solid var(--line);background:#fbfbfe;padding:22px 16px;display:flex;flex-direction:column;gap:12px;position:sticky;top:0;height:100vh}
+.brand{font-weight:600;font-size:15px;padding:0 6px 6px}
+aside .ghost{width:100%;height:38px;background:#fff;color:var(--ink);border:1px solid var(--line);font-size:13.5px}aside .ghost:hover{background:#f3f4f9}
+#search{height:36px;font-size:13px}
+.list{flex:1;overflow-y:auto;overflow-x:hidden;margin:0 -6px;padding:0 6px}
+.item{display:grid;grid-template-columns:8px 1fr;gap:10px;padding:10px 8px;border-radius:9px;cursor:pointer;align-items:start}.item:hover{background:#f1f2f8}.item.on{background:#eceef7}
+.dot{width:8px;height:8px;border-radius:50%;margin-top:6px;background:#c8ccd8}.dot.running{background:#e8a33b;box-shadow:0 0 0 3px #e8a33b33}.dot.done{background:var(--g)}.dot.error{background:#d6453d}.dot.queued{background:#9aa1b5}
+.item b{font-weight:500;font-size:13.5px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.item small{color:var(--mut);font-size:12px}
+.nolist{color:var(--mut);font-size:13px;padding:16px 8px}
+.sfoot{border-top:1px solid var(--line);padding-top:12px;font-size:12.5px;color:var(--mut);display:flex;flex-direction:column;gap:8px}
+.sfoot .r{display:flex;gap:12px;flex-wrap:wrap}.sfoot a,.sfoot button.lnk{color:var(--sub);background:none;border:0;padding:0;height:auto;font-size:12.5px;cursor:pointer;text-decoration:underline}
+main{padding:30px 44px 70px;max-width:1240px;width:100%}
+h1{font-size:34px;line-height:1.18;font-weight:600;letter-spacing:-.025em;margin:26px 0 12px;max-width:640px}
+.lede{color:var(--mut);font-size:16px;margin:0 0 28px;max-width:560px}
+.card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:24px;box-shadow:0 1px 2px #1b1f2e08}
+label{display:block;font-size:13px;font-weight:500;color:var(--sub);margin:0 0 6px}label i{font-style:normal;color:var(--mut);font-weight:400}
+input,select,textarea{width:100%;height:42px;font-size:14px;color:var(--ink);padding:0 12px;border:1px solid var(--line);border-radius:10px;background:#fff;outline:none;transition:border-color .12s,box-shadow .12s}
+textarea{height:112px;padding:10px 12px;resize:vertical;line-height:1.5}
+input::placeholder,textarea::placeholder{color:#a9aebd}input:focus,select:focus,textarea:focus{border-color:var(--g);box-shadow:0 0 0 3px #1f7a5c1a}
+.f{margin-bottom:16px}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.seg{display:inline-flex;background:#f1f2f8;border-radius:10px;padding:3px;margin-bottom:18px}.seg button{height:30px;padding:0 14px;border-radius:8px;background:none;color:var(--sub);font-size:13px}.seg button.on{background:#fff;color:var(--ink);box-shadow:0 1px 2px #1b1f2e14}
+.chk{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--sub);margin:2px 0 0;font-weight:400}.chk input{width:16px;height:16px;accent-color:var(--g);padding:0}
+.act{display:flex;align-items:center;gap:16px;margin-top:20px;flex-wrap:wrap}
+button{font-size:14px;font-weight:500;height:42px;padding:0 20px;border:0;border-radius:10px;background:var(--g);color:#fff;cursor:pointer;white-space:nowrap;flex:none}button:hover{background:#196a4f}button:disabled{opacity:.5;cursor:default}
+button.quiet{background:#fff;color:var(--ink);border:1px solid var(--line);height:36px;padding:0 14px;font-size:13px}button.quiet:hover{background:#f5f6fa}button.danger{color:#c8372d}
+.hint{color:var(--mut);font-size:13px}.err{color:#c8372d;font-size:13px}.ok{color:var(--g);font-size:13px}
+#review{margin-top:18px}.rv{max-height:300px;overflow:auto;margin:10px -8px 0;padding:0 8px}.rv label{display:flex;gap:10px;align-items:center;padding:8px 0;border-top:1px solid #eef0f5;margin:0;font-weight:400;color:var(--ink);font-size:13.5px}.rv input{width:16px;height:16px;accent-color:var(--g);flex:none}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin:6px 0 4px}.top h2{font-size:24px;font-weight:600;letter-spacing:-.02em;margin:0;line-height:1.25}
+.top h2{min-width:0;overflow-wrap:anywhere}.meta{color:var(--mut);font-size:13px;margin:6px 0 18px}.meta a{color:var(--sub)}
+.bar{height:4px;border-radius:4px;background:#e8eaf1;overflow:hidden}.bar i{display:block;height:100%;width:0;background:var(--g);transition:width .4s}
+.status{display:flex;justify-content:space-between;margin-top:10px;font-size:13px;color:var(--sub)}.status.bad{color:#c8372d}
+details{margin-top:12px;font-size:13px;color:var(--mut)}summary{cursor:pointer}
+pre{margin:8px 0 0;padding:12px;background:#f5f6fa;border-radius:10px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--sub);max-height:200px;overflow-wrap:anywhere;overflow:auto;white-space:pre-wrap}
+.stats{display:flex;gap:34px;margin:22px 0 18px}.stats div{font-size:12.5px;color:var(--mut)}
+.stats b{display:block;font-size:20px;font-weight:600;color:var(--ink);letter-spacing:-.01em;font-variant-numeric:tabular-nums;margin-top:2px}.stats small{font-size:13px;font-weight:500;color:var(--mut)}
+.hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}.hd h3{margin:0;font-size:15px;font-weight:600}
+a.dl{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none;border:1px solid var(--line);border-radius:9px;padding:7px 12px}a.dl:hover{background:#f5f6fa}
+.rows{max-height:68vh;overflow:auto;margin:0 -8px;padding:0 8px}
+.row{display:grid;grid-template-columns:48px 168px 1fr;gap:12px;padding:12px 0;border-top:1px solid #eef0f5;font-size:14px;align-items:baseline}.row:first-child{border-top:0}
+.t{color:var(--mut);font-size:12.5px;font-variant-numeric:tabular-nums}.who{font-size:13px;font-weight:500;color:var(--sub);display:flex;align-items:center;gap:7px}.who b{width:6px;height:6px;border-radius:50%;flex:none}
+.x{white-space:pre-line}.empty{color:var(--mut);padding:26px 0;text-align:center;font-size:14px}
+@media(max-width:820px){.app{grid-template-columns:1fr}aside{position:static;height:auto;max-height:340px}main{padding:22px 18px 60px}.two{grid-template-columns:1fr}.row{grid-template-columns:40px 1fr}.row .x{grid-column:1/-1}}
 </style>
-<h1>Nepali podcast &rarr; SRT</h1>
-<input id=url placeholder="Paste YouTube link (https://youtu.be/...)">
-<div class=row>
- <label>Start at (min) <input class=n id=start type=number min=0 placeholder=0></label>
- <label>Only first (min) <input class=n id=limit type=number min=1 placeholder="full"></label>
- <small>Tip: "Only first 10" = cheap test run.</small>
-</div>
-<h3>Transcription models <small id=nsel></small></h3>
-<div class=models id=stt>loading models...</div>
-<div class=row>
- <label><input type=checkbox id=clean checked> Write English words in English letters</label>
- <label><input type=checkbox id=en checked> Also translate to English</label> <small>using</small>
- <select id=enmodel></select><span class=muted id=enprice></span>
- <button id=go style="margin-left:auto">Generate SRT</button>
-</div>
-<details style="margin:10px 0"><summary class=muted style="cursor:pointer">Already have an SRT in outputs/? Clean or translate it (no transcription cost)</summary>
- <div class=row style="margin-top:10px"><select id=ex style="min-width:320px"></select>
-  <label><input type=checkbox id=exclean checked> English words in English letters</label>
-  <label><input type=checkbox id=exen checked> English SRT</label>
-  <button id=exgo>Run on this SRT</button></div></details>
-<div class=steps><div class=s id=s_download>1 Download</div><div class=s id=s_transcribe>2 Transcribe</div><div class=s id=s_translate>3 English</div><div class=s id=s_done>4 Done</div></div>
-<div class=bar><i id=bar></i></div><small id=detail></small>
-<h3>Log</h3><pre id=log></pre>
-<div id=res style="display:none">
- <h3>Results <small>(click a row to view; compare cost, speed and read the text)</small></h3>
- <table id=tbl></table>
- <div class=row><b id=cur></b> <span style="margin-left:auto"></span>
-  <button id=tabNe>Nepali</button><button id=tabEn>English</button>
-  <a class=btn id=dl href=#>Download .srt</a><a class=btn id=dlEn href=# style="display:none">Download .en.srt</a>
-  <button id=tr>Translate to English</button></div>
- <textarea id=txt readonly></textarea>
+<div class=app>
+<aside>
+ <div class=brand>Podcast SRT</div>
+ <button class=ghost id=newbtn>+ New transcript</button>
+ <input id=search placeholder="Search history">
+ <div class=list id=list><div class=nolist>No transcripts yet.</div></div>
+ <div class=sfoot><span id=qsum>&nbsp;</span>
+  <div class=r><a href=/api/zip id=zip>Download all (.zip)</a><button class=lnk id=retryall hidden>Retry failed</button><a href=/logout id=logout hidden>Log out</a></div></div>
+</aside>
+<main>
+<section id=pNew>
+ <h1>Turn a YouTube link into a speaker-labelled SRT</h1>
+ <p class=lede>Paste one link, many links, or a whole playlist or channel. Every subtitle line comes back with who is speaking.</p>
+ <div class=card>
+  <div class=seg><button class=on id=m1>One video</button><button id=mN>Many videos</button></div>
+  <div class=f id=f1><label>YouTube link</label><input id=url placeholder="https://www.youtube.com/watch?v=..."></div>
+  <div class=f id=fN hidden><label>Links <i>(one per line; playlist and channel links are expanded)</i></label><textarea id=urls placeholder="https://www.youtube.com/watch?v=...&#10;https://www.youtube.com/playlist?list=..."></textarea></div>
+  <div class="two f">
+   <div><label>Start time</label><select id=start></select></div>
+   <div><label>End time</label><select id=end></select></div>
+  </div>
+  <div class=hint style="margin:-4px 0 16px">Tip: choose an End time like 0:30 for a quick test.</div>
+  <div class="two f">
+   <div><label>Model</label><select id=model><option>Loading models...</option></select></div>
+   <div><label>Speaker names <i>(optional)</i></label><input id=spknames placeholder="Host Name, Guest Name"></div>
+  </div>
+  <label class=chk><input type=checkbox id=label checked> Label speakers <span class=hint>(slower; turn off for plain text)</span></label>
+  <div class=act><button id=go>Generate SRT</button><span class=err id=err></span><span class=ok id=okmsg></span></div>
+ </div>
+ <div class=card id=review hidden>
+  <div class=hd><h3 id=rvtitle></h3><button class=quiet id=rvall>Untick all</button></div>
+  <div class=rv id=rvlist></div>
+  <div class=act><button id=rvgo>Queue selected</button><span class=err id=rverr></span></div>
+ </div>
+</section>
+
+<section id=pJob hidden>
+ <div class=top><h2 id=jtitle>&nbsp;</h2>
+  <div style="display:flex;gap:8px"><button class="quiet" id=jretry hidden>Retry</button><button class="quiet" id=jcancel hidden>Cancel</button><button class="quiet danger" id=jdel>Delete</button></div></div>
+ <div class=meta id=jmeta></div>
+ <div id=jrun>
+  <div class=bar><i id=bar></i></div>
+  <div class=status id=jstatus><span id=detail>Queued</span><span id=stage></span></div>
+ </div>
+ <details><summary>Log</summary><pre id=log></pre></details>
+ <div id=jout hidden>
+  <div class=stats>
+   <div>Cost<b id=s_cost>&ndash;</b></div><div>Time<b id=s_time>&ndash;</b></div><div>Subtitle lines<b id=s_cues>&ndash;</b></div><div>Words<b id=s_words>&ndash;</b></div>
+  </div>
+  <div class=card>
+   <div class=hd><h3>Transcript</h3><a class=dl id=dl href=#>Download .srt</a></div>
+   <div class=rows id=rows></div>
+  </div>
+ </div>
+</section>
+</main>
 </div>
 <script>
-const $=id=>document.getElementById(id);let jid,from=0,timer,sel=0,mode='ne',cache={},M;
-const q=a=>JSON.stringify(a);
+const $=id=>document.getElementById(id);
+const COL=['#4f5bd5','#e8743b','#1f7a5c','#2d9cc4','#c79a1f','#b8374a'],esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let sel=null,mode='one',logFrom=0,loaded=null,lastJob=null,review=[];
+const fmt=t=>{t=Math.round(t);const h=Math.floor(t/3600),m=Math.floor(t%3600/60),x=t%60;return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0')};
+const ago=t=>{const s=Date.now()/1000-t;return s<60?'just now':s<3600?Math.floor(s/60)+' min ago':s<86400?Math.floor(s/3600)+' h ago':Math.floor(s/86400)+' d ago'};
+const api=async(p,body)=>{const r=await fetch(p,body===undefined?{}:{method:'POST',body:JSON.stringify(body)});if(r.status==401){location='/login';throw 0}
+ let d={};try{d=await r.json()}catch(e){}return {ok:r.ok,d}};
+function timeUI(){ // 30 s steps for the first 10 min (short tests), then every minute up to 4 h
+ const ts=[];for(let t=0;t<=14400;t+=t<600?30:60)ts.push(t);
+ const o=ts.map(t=>`<option value="${t}">${fmt(t)}</option>`).join('');
+ $('start').innerHTML=o;$('end').innerHTML='<option value="">End of video</option>'+o;
+}
 async function init(){
- M=await (await fetch('/api/models')).json();
- $('stt').innerHTML=M.stt.map(m=>`<label><input type=checkbox value="${m.id}" ${M.default_stt.includes(m.id)?'checked':''}><b>${m.name}</b><small>${m.id}</small><span>${m.price}</span></label>`).join('');
- $('enmodel').innerHTML=M.tr.map(m=>`<option value="${m.id}">${m.name}</option>`).join('');
- $('enmodel').value=M.default_tr;upd();
- $('stt').onchange=upd;$('enmodel').onchange=upd;
+ timeUI();$('logout').hidden=!"{{AUTH}}";
+ const {d:M}=await api('/api/models');
+ $('model').innerHTML=M.stt.map(m=>`<option value="${m.id}">${esc(m.name)} · ${esc(m.price)}</option>`).join('');
+ if(M.stt.some(m=>m.id==M.default_stt[0]))$('model').value=M.default_stt[0];
+ await loadList();setInterval(tick,2500);
 }
-function upd(){
- $('nsel').textContent='('+picked().length+' selected)';
- const m=M.tr.find(x=>x.id==$('enmodel').value);$('enprice').textContent=m?m.price+' · '+m.est:'';
+function setMode(m){mode=m;$('m1').className=m=='one'?'on':'';$('mN').className=m=='many'?'on':'';$('f1').hidden=m!='one';$('fN').hidden=m!='many';
+ $('go').textContent=m=='one'?'Generate SRT':'Add to queue';$('review').hidden=true;$('err').textContent=$('okmsg').textContent=''}
+$('m1').onclick=()=>setMode('one');$('mN').onclick=()=>setMode('many');
+function showNew(){sel=null;loaded=null;$('pNew').hidden=false;$('pJob').hidden=true;renderList()}
+$('newbtn').onclick=showNew;
+let jobs=[],counts={};
+async function loadList(){
+ const {d}=await api('/api/jobs?q='+encodeURIComponent($('search').value.trim()));jobs=d.jobs;counts=d.counts;renderList();
+ const c=counts;$('qsum').textContent=[c.running?'1 running':'',c.queued?c.queued+' queued':'',c.done+' done',c.error?c.error+' failed':''].filter(Boolean).join(' · ');
+ $('retryall').hidden=!c.error;
 }
-const picked=()=>[...document.querySelectorAll('#stt input:checked')].map(x=>x.value);
-$('go').onclick=async()=>{
- $('log').textContent='';$('res').style.display='none';from=0;cache={};sel=0;
- const r=await fetch('/api/start',{method:'POST',body:q({url:$('url').value,start:$('start').value,limit:$('limit').value,models:picked(),en:$('en').checked,clean:$('clean').checked,en_model:$('enmodel').value})});
- const d=await r.json();if(!r.ok){$('log').innerHTML='<span class=err>'+d.error+'</span>';return}
- jid=d.id;$('go').disabled=true;clearInterval(timer);timer=setInterval(poll,1000);
-};
-$('tr').onclick=async()=>{
- await fetch('/api/translate',{method:'POST',body:q({id:jid,idx:sel,en_model:$('enmodel').value})});
- $('go').disabled=true;clearInterval(timer);timer=setInterval(poll,1000);
-};
-$('tabNe').onclick=()=>{mode='ne';show()};$('tabEn').onclick=()=>{mode='en';show()};
-async function poll(){
- const j=await (await fetch(`/api/job/${jid}?from=${from}`)).json();from=j.next;
+function sub(j){return j.status=='running'?(j.detail||'Running'):j.status=='done'?`${j.cues} lines · ${ago(j.finished_at||j.created_at)}`:j.status=='error'?'Failed':j.status=='queued'?'Queued':'Cancelled'}
+function renderList(){
+ $('list').innerHTML=jobs.length?jobs.map(j=>`<div class="item ${sel==j.id?'on':''}" data-id="${j.id}"><span class="dot ${j.status}"></span><span><b>${esc(j.title||j.video_id||j.url)}</b><small>${esc(sub(j))}</small></span></div>`).join(''):'<div class=nolist>No transcripts yet.</div>';
+ document.querySelectorAll('.item').forEach(e=>e.onclick=()=>openJob(+e.dataset.id));
+}
+let st;$('search').oninput=()=>{clearTimeout(st);st=setTimeout(loadList,250)};
+async function tick(){await loadList();if(sel!=null&&(!lastJob||['queued','running'].includes(lastJob.status)))await pollJob()}
+async function openJob(id){sel=id;logFrom=0;loaded=null;lastJob=null;$('log').textContent='';$('pNew').hidden=true;$('pJob').hidden=false;$('jout').hidden=true;$('rows').innerHTML='';renderList();await pollJob()}
+async function pollJob(){
+ const id=sel,{ok,d:j}=await api(`/api/job/${id}?from=${logFrom}`);if(!ok||id!=sel)return;lastJob=j;logFrom=j.next;
  if(j.log.length){$('log').textContent+=j.log.join('\n')+'\n';$('log').scrollTop=1e9}
- $('bar').style.width=(j.progress||0)+'%';$('detail').textContent=(j.detail||'')+' '+Math.round(j.progress||0)+'%';
- $('s_translate').style.display=j.want_en?'':'none';
- const order=['download','transcribe','translate','done'],i=order.indexOf(j.stage);
- order.forEach((s,k)=>$('s_'+s).className='s'+(k<i||j.stage=='done'?' ok':k==i?' on':''));
- renderTable(j.results);
- if(j.status!='running'){clearInterval(timer);$('go').disabled=false;show()}
+ $('jtitle').textContent=j.title||j.video_id||j.url;
+ const range=(j.start_s||j.end_s)?` · ${fmt(j.start_s||0)}–${j.end_s?fmt(j.end_s):'end'}`:'';
+ $('jmeta').innerHTML=`<a href="${esc(j.url)}" target=_blank rel=noopener>Open on YouTube</a> · ${esc(j.model)}${range}${j.label_speakers?'':' · no speaker labels'} · added ${ago(j.created_at)}`;
+ const live=j.status=='queued'||j.status=='running';
+ $('jrun').hidden=j.status=='done';
+ $('bar').style.width=(j.status=='error'?0:j.progress||0)+'%';
+ $('detail').textContent=j.status=='error'?(j.error||'Failed. See the log.'):j.status=='cancelled'?'Cancelled':j.status=='queued'?'Waiting in the queue':(j.detail||'Working...');
+ $('jstatus').className='status'+(j.status=='error'?' bad':'');
+ $('stage').textContent=live?j.stage:'';
+ $('jretry').hidden=!(j.status=='error'||j.status=='cancelled');$('jcancel').hidden=j.status!='queued';
+ if(j.status=='done'){
+  $('s_cost').textContent='$'+(j.cost??0);$('s_time').innerHTML=(j.seconds??0)+' <small>s</small>';$('s_cues').textContent=j.cues;$('s_words').textContent=j.words;
+  if(loaded!=id){loaded=id;const {d}=await api(`/api/result/${id}`);if(id==sel)showRows(d.text,id)}
+ }
 }
-function renderTable(rs){
- if(!rs.length)return;$('res').style.display='block';
- $('tbl').innerHTML='<tr><th>Model</th><th>Cost</th><th>Time</th><th>Cues</th><th>Words</th><th>English</th></tr>'+rs.map((r,k)=>
-  r.error?`<tr><td>${r.model}</td><td colspan=5 class=err>${r.error}</td></tr>`:
-  `<tr class="pick ${k==sel?'sel':''}" onclick="sel=${k};show()"><td>${r.model}</td><td>$${r.cost}${r.en_cost?' + $'+r.en_cost:''}</td><td>${r.seconds}s</td><td>${r.cues}</td><td>${r.words}</td><td>${r.has_en?'yes':'-'}</td></tr>`).join('');
- window.RS=rs;
+function showRows(text,id){
+ $('dl').href=`/api/file/${id}`;$('jout').hidden=false;const who=[];
+ $('rows').innerHTML=text.trim().split(/\n\n+/).map(b=>{const l=b.split('\n'),t=(l[1]||'').slice(3,8),body=l.slice(2).join('\n'),m=body.match(/^([^:\n]{2,40}):\s+([\s\S]*)/);
+  const sp=m?m[1]:'',tx=m?m[2]:body;if(sp&&!who.includes(sp))who.push(sp);const c=COL[Math.max(who.indexOf(sp),0)%COL.length];
+  return `<div class=row><span class=t>${esc(t)}</span><span class=who>${sp?`<b style="background:${c}"></b>${esc(sp)}`:''}</span><span class=x>${esc(tx)}</span></div>`}).join('')||'<div class=empty>No text.</div>';
 }
-async function show(){
- const r=(window.RS||[])[sel];if(!r||r.error)return;
- $('cur').textContent=r.model;
- const key=sel+':'+r.has_en;
- if(!cache[key])cache[key]=await (await fetch(`/api/result/${jid}/${sel}`)).json();
- if(mode=='en'&&!r.has_en)mode='ne';
- $('txt').value=mode=='en'?cache[key].en_text:cache[key].text;
- $('dl').href=`/api/file/${jid}/${sel}`;$('dlEn').href=`/api/file/${jid}/${sel}?en=1`;
- $('dlEn').style.display=r.has_en?'':'none';$('tr').style.display=r.has_en?'none':'';
- $('tabEn').style.display=r.has_en?'':'none';
- renderTable(window.RS);
+$('jretry').onclick=async()=>{await api('/api/retry',{id:sel});lastJob=null;logFrom=0;$('log').textContent='';await tick()};
+$('jcancel').onclick=async()=>{await api('/api/cancel',{id:sel});lastJob=null;await tick()};
+$('jdel').onclick=async()=>{if(!confirm('Delete this transcript?'))return;await api('/api/delete',{id:sel});showNew();await loadList()};
+$('retryall').onclick=async()=>{await api('/api/retry',{all_failed:true});await loadList()};
+
+const params=()=>({start:+$('start').value,end:$('end').value===''?null:+$('end').value,model:$('model').value,speakers:$('spknames').value,label:$('label').checked});
+async function enqueue(items){
+ const p=params();if(p.end!=null&&p.end<=p.start)return {error:'End time must be after start time'};
+ const {ok,d}=await api('/api/enqueue',{...p,items});return ok?d:{error:d.error||'Failed'};
 }
-$('exgo').onclick=async()=>{
- $('log').textContent='';$('res').style.display='none';from=0;cache={};sel=0;
- const r=await fetch('/api/srt-job',{method:'POST',body:q({file:$('ex').value,clean:$('exclean').checked,en:$('exen').checked,en_model:$('enmodel').value})});
- const d=await r.json();if(!r.ok){$('log').innerHTML='<span class=err>'+d.error+'</span>';return}
- jid=d.id;$('go').disabled=true;clearInterval(timer);timer=setInterval(poll,1000);
+$('go').onclick=async()=>{
+ $('err').textContent=$('okmsg').textContent='';$('review').hidden=true;
+ const p=params();if(p.end!=null&&p.end<=p.start)return $('err').textContent='End time must be after start time';
+ $('go').disabled=true;
+ try{
+  if(mode=='one'){
+   const r=await enqueue([{url:$('url').value.trim()}]);if(r.error)return $('err').textContent=r.error;
+   $('url').value='';await loadList();const id=r.ids[0]??(jobs.find(j=>j.url)||{}).id;if(id)openJob(id);else $('okmsg').textContent='Already in the queue.';
+  }else{
+   $('okmsg').textContent='Reading links...';
+   const {ok,d}=await api('/api/expand',{text:$('urls').value});$('okmsg').textContent='';
+   if(!ok)return $('err').textContent=d.error;
+   if(!d.items.length)return $('err').textContent='No YouTube links found';
+   if(d.expanded){review=d.items;$('rvtitle').textContent=`Found ${d.items.length} videos`;
+    $('rvlist').innerHTML=d.items.map((it,i)=>`<label><input type=checkbox checked data-i="${i}">${esc(it.title||it.id)}</label>`).join('');
+    $('rverr').textContent='';$('rvgo').textContent=`Queue ${d.items.length} videos`;$('review').hidden=false;return}
+   const r=await enqueue(d.items);if(r.error)return $('err').textContent=r.error;
+   $('urls').value='';$('okmsg').textContent=`Queued ${r.queued} video${r.queued==1?'':'s'}`+(r.duplicates?` (${r.duplicates} already queued)`:'');await loadList();
+  }
+ }finally{$('go').disabled=false}
 };
-async function loadSrts(){const l=await (await fetch('/api/srts')).json();
- $('ex').innerHTML=l.map(x=>`<option value="${x.name}">${x.name} - ${x.cues} cues, ${x.nepali_cues} with Nepali${x.has_en?' (has English)':''}</option>`).join('')||'<option>no SRTs yet</option>'}
-loadSrts();
+function picked(){return [...document.querySelectorAll('#rvlist input:checked')].map(e=>review[+e.dataset.i])}
+$('rvlist').onchange=()=>{$('rvgo').textContent=`Queue ${picked().length} videos`};
+$('rvall').onclick=()=>{const all=[...document.querySelectorAll('#rvlist input')],on=all.some(e=>!e.checked);all.forEach(e=>e.checked=on);$('rvall').textContent=on?'Untick all':'Tick all';$('rvlist').onchange()};
+$('rvgo').onclick=async()=>{
+ const items=picked();if(!items.length)return $('rverr').textContent='Tick at least one video';
+ $('rvgo').disabled=true;const r=await enqueue(items);$('rvgo').disabled=false;if(r.error)return $('rverr').textContent=r.error;
+ $('review').hidden=true;$('urls').value='';$('okmsg').textContent=`Queued ${r.queued} video${r.queued==1?'':'s'}`+(r.duplicates?` (${r.duplicates} already queued)`:'');await loadList();
+};
 init();
-</script>"""
+</script>
+"""
 
 if __name__ == "__main__":
-    srv = ThreadingHTTPServer(("127.0.0.1", 8765), H)
-    print("UI at http://127.0.0.1:8765  (Ctrl+C to stop)  SRTs saved in ./outputs")
-    threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8765")).start()
+    host, port = os.environ.get("UI_HOST", "127.0.0.1"), int(os.environ.get("UI_PORT", 8765))
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    if not loopback and not PASSWORD: sys.exit("refusing to listen on a non-loopback address without UI_PASSWORD set")
+    db.init(DB_PATH)
+    if not os.environ.get("NO_WORKER"): threading.Thread(target=worker, daemon=True).start()
+    srv = ThreadingHTTPServer((host, port), H)
+    print(f"UI at http://{host}:{port}  (Ctrl+C to stop)  database {DB_PATH}")
+    if loopback and not os.environ.get("NO_BROWSER"): threading.Timer(0.8, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
     srv.serve_forever()
