@@ -11,7 +11,7 @@ apt-get install -y ffmpeg python3-venv python3-pip curl ca-certificates   # new 
 # yt-dlp needs a JS runtime. An existing Node (used by your other apps) is left exactly as it is.
 if command -v node >/dev/null 2>&1; then
     echo "using the existing Node $(node -v) (not touched)"
-    node -v | grep -qE '^v(2[0-9]|[3-9][0-9])' || echo "WARNING: yt-dlp prefers Node 20+; if YouTube downloads fail, install a separate Node for this app only"
+    node -v | grep -qE '^v(2[2-9]|[3-9][0-9])' || echo "WARNING: yt-dlp rejects Node older than 22 for YouTube; if YouTube downloads fail, install a separate Node for this app only"
 else
     apt-get install -y nodejs
 fi

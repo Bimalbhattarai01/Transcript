@@ -1,5 +1,5 @@
 # Podcast SRT: web UI + queue worker. CPU only (sherpa-onnx speaker labels); no torch, no HuggingFace token.
-FROM node:20-slim AS node
+FROM node:24-slim AS node   # yt-dlp rejects Node 20 as "unsupported" for its YouTube JS challenges
 
 FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DATA_DIR=/data NO_BROWSER=1
