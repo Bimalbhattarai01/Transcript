@@ -1,0 +1,34 @@
+# docker compose up -d --build
+# then create the first login:  docker compose exec srt python manage.py adduser alice
+services:
+  srt:
+    build: .
+    image: transcribe-srt:latest
+    container_name: transcribe-srt
+    restart: unless-stopped
+    env_file: .env                      # OPENROUTER_API_KEY, YT_COOKIES, ... (the file is not baked into the image)
+    environment:
+      UI_HOST: 0.0.0.0                  # inside the container; the PUBLISHED port below decides who can reach it
+      UI_PORT: "8765"
+      UI_REQUIRE_LOGIN: "1"             # refuses to start until a user exists
+      KEEP_AUDIO: "0"
+      DIARIZER: fast
+      DIARIZE_THREADS: "3"
+      DATA_DIR: /data
+    ports:
+      # 127.0.0.1 = only this machine (nginx on the host proxies to it). If your nginx runs in Docker use BIND_ADDR=172.17.0.1
+      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8765}:8765"
+    volumes:
+      - srt-data:/data                  # database, downloads, outputs, speaker models, yt-dlp
+      # - ./cookies.txt:/data/cookies.txt:ro   # then set YT_COOKIES=/data/cookies.txt in .env
+    cpus: "3"                           # this server runs other services: cap the batch job
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/login', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  srt-data:
