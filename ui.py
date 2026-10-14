@@ -76,7 +76,9 @@ def expand_playlist(url):
         for x in e.get("entries") or []:
             if x.get("entries"): yield from walk(x)
             elif x.get("id"): yield {"id": x["id"], "title": x.get("title"), "url": f"https://www.youtube.com/watch?v={x['id']}"}
-    return list(walk(json.loads(p.stdout)))
+    data = json.loads(p.stdout)
+    title = re.sub(r"\s*[-–|]\s*(Videos|Shorts|Live|Playlists|Podcasts)\s*$", "", data.get("title") or "").strip()  # "Channel - Videos" -> "Channel"
+    return title, list(walk(data))
 
 
 def oembed_title(url):
@@ -209,6 +211,12 @@ def login_required():
 fails = {}  # ip -> recent failed login times
 
 
+def project_arg(qs):
+    """?project= : empty/absent = every job, 'none' = jobs without a project, a number = that project."""
+    v = (qs.get("project") or [""])[0]
+    return 0 if v == "none" else int(v) if v.isdigit() else None
+
+
 def safe_name(s):
     return re.sub(r"[^\w\-. ()\[\]]+", "_", s or "transcript").strip(" ._")[:90] or "transcript"
 
@@ -264,7 +272,9 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/me": return self.send(200, json.dumps({"user": self.user["username"] if self.user else None}))
         if u.path == "/api/models": return self.send(200, json.dumps(get_models()))
         if u.path == "/api/jobs":
-            return self.send(200, json.dumps({"jobs": db.list_jobs((qs.get("q") or [""])[0].strip()), "counts": db.counts()}))
+            return self.send(200, json.dumps({"jobs": db.list_jobs((qs.get("q") or [""])[0].strip(), project_arg(qs)), "counts": db.counts()}))
+        if u.path == "/api/projects":
+            return self.send(200, json.dumps({"projects": db.list_projects(), "unfiled": db.unfiled_count()}))
         if parts[:2] == ["api", "job"] and len(parts) == 3 and parts[2].isdigit():
             j = db.get(int(parts[2]), db.LIST_COLS + ", speakers_hint, log")
             if not j: return self.send(404, "{}")
@@ -281,8 +291,9 @@ class H(BaseHTTPRequestHandler):
                              {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"})
         if u.path == "/api/zip":
             ids = [int(i) for i in (qs.get("ids") or [""])[0].split(",") if i.isdigit()]
-            rows = db.q("SELECT id, title, video_id, srt_text FROM jobs WHERE status='done' AND srt_text IS NOT NULL ORDER BY id")
-            rows = [r for r in rows if not ids or r["id"] in ids]
+            rows = db.q("SELECT id, title, video_id, srt_text, project_id FROM jobs WHERE status='done' AND srt_text IS NOT NULL ORDER BY id")
+            pr = project_arg(qs)
+            rows = [r for r in rows if (not ids or r["id"] in ids) and (pr is None or (r["project_id"] or 0) == pr)]
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
                 for r in rows: z.writestr(f"{safe_name(r['title'] or r['video_id'])} [{r['id']}].srt", r["srt_text"])
@@ -309,17 +320,17 @@ class H(BaseHTTPRequestHandler):
         if not self.authed(): return self.err("login required", 401)
         d = self.jbody()
         if self.path == "/api/expand":
-            items, skipped, expanded, seen = [], [], False, set()
+            items, skipped, expanded, seen, suggest = [], [], False, set(), ""
             for url in re.findall(r"https?://\S+", d.get("text") or ""):
                 try:
-                    if is_playlist(url) and not re.search(r"[?&]v=", url): found = expand_playlist(url); expanded = True
+                    if is_playlist(url) and not re.search(r"[?&]v=", url): ptitle, found = expand_playlist(url); expanded = True; suggest = suggest or ptitle
                     elif YT.match(url) and video_id(url): found = [{"id": video_id(url), "title": None, "url": url}]
                     else: skipped.append(url); continue
                 except Exception as e:
                     return self.err(f"Could not read {url}: {e}")
                 for it in found:
                     if it["id"] not in seen: seen.add(it["id"]); items.append(it)
-            return self.send(200, json.dumps({"items": items, "expanded": expanded, "skipped": skipped}))
+            return self.send(200, json.dumps({"items": items, "expanded": expanded, "skipped": skipped, "suggest": suggest}))
         if self.path == "/api/enqueue":
             model = d.get("model") or ""
             if not re.fullmatch(r"[\w.\-]+/[\w.\-:]+", model): return self.err("Pick a transcription model")
@@ -333,14 +344,22 @@ class H(BaseHTTPRequestHandler):
             label = bool(d.get("label", True))
             items = [it for it in (d.get("items") or []) if YT.match(it.get("url") or "") and video_id(it["url"])]
             if not items: return self.err("Paste a valid YouTube link")
+            project_id = None
+            try:
+                if (d.get("new_project") or "").strip(): project_id = db.add_project(d["new_project"], self.user["username"] if self.user else None)
+                elif d.get("project_id"):
+                    project_id = int(d["project_id"])
+                    if not db.project_exists(project_id): return self.err("That project no longer exists")
+            except ValueError as e:
+                return self.err(str(e))
             batch = db.add_batch(f"{len(items)} videos") if len(items) > 1 else None
             ids, dup = [], 0
             for it in items:
                 vid = video_id(it["url"])
                 if db.active_duplicate(vid, start, end, model, hint, label): dup += 1; continue
                 ids.append(db.add_job(batch, it["url"], vid, it.get("title"), start, end, model, hint, label,
-                                      self.user["username"] if self.user else None))
-            return self.send(200, json.dumps({"ids": ids, "queued": len(ids), "duplicates": dup}))
+                                      self.user["username"] if self.user else None, project_id))
+            return self.send(200, json.dumps({"ids": ids, "queued": len(ids), "duplicates": dup, "project_id": project_id}))
         if self.path == "/api/retry":
             where = "status IN ('error','cancelled')" + ("" if d.get("all_failed") else " AND id=?")
             db.x(f"UPDATE jobs SET status='queued', stage='queued', progress=0, detail='', error=NULL, srt_text=NULL WHERE {where}",
@@ -351,7 +370,22 @@ class H(BaseHTTPRequestHandler):
             db.x(f"UPDATE jobs SET status='cancelled', stage='cancelled' WHERE {where}", () if d.get("all_queued") else (int(d.get("id") or 0),))
             return self.send(200, "{}")
         if self.path == "/api/delete":
-            db.x("DELETE FROM jobs WHERE id=? AND status<>'running'", (int(d.get("id") or 0),))
+            ids = d.get("ids") if isinstance(d.get("ids"), list) else [d.get("id") or 0]
+            return self.send(200, json.dumps({"deleted": db.delete_jobs(ids)}))
+        if self.path == "/api/move":
+            pid = d.get("project_id")
+            if pid is not None and not db.project_exists(int(pid)): return self.err("That project no longer exists")
+            db.move_jobs(d.get("ids") or [], None if pid is None else int(pid))
+            return self.send(200, "{}")
+        if self.path == "/api/project":
+            try:
+                act = d.get("action")
+                if act == "create": return self.send(200, json.dumps({"id": db.add_project(d.get("name"), self.user["username"] if self.user else None)}))
+                if act == "rename": db.rename_project(int(d.get("id") or 0), d.get("name"))
+                elif act == "delete": db.delete_project(int(d.get("id") or 0), bool(d.get("delete_jobs")))
+                else: return self.err("unknown action")
+            except ValueError as e:
+                return self.err(str(e))
             return self.send(200, "{}")
         self.send(404, "{}")
 
@@ -407,25 +441,43 @@ document.getElementById('f').addEventListener('submit',()=>{const b=document.get
 PAGE = r"""<!doctype html><meta charset=utf-8><title>Podcast SRT</title><meta name=viewport content="width=device-width,initial-scale=1">
 <style>
 @font-face{font-family:Inter;src:url(/static/Inter.woff2) format("woff2");font-weight:100 900;font-display:swap}
-:root{--ink:#1b1f2e;--mut:#8a90a2;--sub:#6b7186;--line:#e4e7ee;--g:#1f7a5c}
+:root{--ink:#1b1f2e;--mut:#8a90a2;--sub:#6b7186;--line:#e4e7ee;--g:#1f7a5c;--red:#c8372d}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif;font-feature-settings:"cv11","ss03";-webkit-font-smoothing:antialiased;
  background:radial-gradient(900px 380px at 25% -8%,#e8ebfb,transparent 70%),#f7f8fc}
 input,select,button,textarea{font-family:Inter,system-ui,sans-serif}
-.app{display:grid;grid-template-columns:292px 1fr;min-height:100vh}
-aside{border-right:1px solid var(--line);background:#fbfbfe;padding:22px 16px;display:flex;flex-direction:column;gap:12px;position:sticky;top:0;height:100vh}
-.brand{font-weight:600;font-size:15px;padding:0 6px 6px}
+svg{width:16px;height:16px;display:block;flex:none}
+.app{display:grid;grid-template-columns:300px 1fr;min-height:100vh}
+aside{border-right:1px solid var(--line);background:#fbfbfe;padding:22px 14px 16px;display:flex;flex-direction:column;gap:10px;position:sticky;top:0;height:100vh}
+.brand{font-weight:600;font-size:15px;padding:0 8px 6px}
 aside .ghost{width:100%;height:38px;background:#fff;color:var(--ink);border:1px solid var(--line);font-size:13.5px}aside .ghost:hover{background:#f3f4f9}
 #search{height:36px;font-size:13px}
-.list{flex:1;overflow-y:auto;overflow-x:hidden;margin:0 -6px;padding:0 6px}
-.item{display:grid;grid-template-columns:8px 1fr;gap:10px;padding:10px 8px;border-radius:9px;cursor:pointer;align-items:start}.item:hover{background:#f1f2f8}.item.on{background:#eceef7}
+.shead{display:flex;align-items:center;justify-content:space-between;font-size:11.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);padding:8px 8px 2px}
+.shead button{height:24px;width:24px;padding:0;background:none;color:var(--sub);border-radius:7px;display:grid;place-items:center;font-size:17px;line-height:1;font-weight:400}.shead button:hover{background:#eceef7;color:var(--ink)}
+.plist{max-height:208px;overflow-y:auto;overflow-x:hidden;margin:0 -6px;padding:0 6px}
+.prow{display:grid;grid-template-columns:16px 1fr auto auto;gap:9px;align-items:center;padding:7px 8px;border-radius:9px;cursor:pointer;font-size:13.5px;color:var(--ink)}
+.prow:hover{background:#f1f2f8}.prow.on{background:#eceef7;font-weight:500}.prow svg{color:var(--sub)}
+.prow span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.prow em{font-style:normal;font-size:12px;color:var(--mut)}
+.ib{height:24px;width:24px;padding:0;border-radius:7px;background:none;color:var(--sub);display:none;place-items:center;border:0;cursor:pointer}.ib:hover{background:#e3e5f0;color:var(--ink)}.ib.del:hover{color:var(--red)}
+.prow .acts{display:none;gap:0}.prow:hover .acts{display:flex}.prow:hover em{display:none}.acts .ib{display:grid}
+.list{flex:1;overflow-y:auto;overflow-x:hidden;margin:0 -6px;padding:0 6px;min-height:120px}
+.item{display:grid;grid-template-columns:8px 1fr 26px;gap:9px;padding:9px 6px 9px 8px;border-radius:9px;cursor:pointer;align-items:start}.item:hover{background:#f1f2f8}.item.on{background:#eceef7}
+.item .ib{display:none}.item:hover .ib{display:grid}
 .dot{width:8px;height:8px;border-radius:50%;margin-top:6px;background:#c8ccd8}.dot.running{background:#e8a33b;box-shadow:0 0 0 3px #e8a33b33}.dot.done{background:var(--g)}.dot.error{background:#d6453d}.dot.queued{background:#9aa1b5}
-.item b{font-weight:500;font-size:13.5px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.item small{color:var(--mut);font-size:12px}
+.item b{font-weight:500;font-size:13.5px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.item small{color:var(--mut);font-size:12px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .nolist{color:var(--mut);font-size:13px;padding:16px 8px}
 .sfoot{border-top:1px solid var(--line);padding-top:12px;font-size:12.5px;color:var(--mut);display:flex;flex-direction:column;gap:8px}
 .sfoot .r{display:flex;gap:12px;flex-wrap:wrap}.sfoot a,.sfoot button.lnk{color:var(--sub);background:none;border:0;padding:0;height:auto;font-size:12.5px;cursor:pointer;text-decoration:underline}
-main{padding:30px 44px 70px;max-width:1240px;width:100%}
-h1{font-size:34px;line-height:1.18;font-weight:600;letter-spacing:-.025em;margin:26px 0 12px;max-width:640px}
+main{padding:0 44px 70px;max-width:1240px;width:100%}
+.topbar{display:flex;justify-content:flex-end;align-items:center;height:64px;position:relative}
+.menu{position:relative}
+.user{height:38px;padding:0 10px 0 5px;gap:9px;display:flex;align-items:center;background:#fff;color:var(--ink);border:1px solid var(--line);border-radius:999px;font-size:13.5px;font-weight:500}.user:hover{background:#f5f6fa}
+.av{width:28px;height:28px;border-radius:50%;background:var(--g);color:#fff;display:grid;place-items:center;font-size:12.5px;font-weight:600;text-transform:uppercase}
+.user svg{color:var(--mut);width:14px;height:14px}
+.drop{position:absolute;right:0;top:46px;min-width:250px;background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:0 14px 34px -14px #1b1f2e40;padding:6px;z-index:30}
+.drop .who2{padding:10px 12px 12px;border-bottom:1px solid #eef0f5;margin-bottom:4px}.drop small{display:block;color:var(--mut);font-size:12px}.drop b{font-weight:500;font-size:13.5px;overflow-wrap:anywhere}
+.drop a{display:flex;align-items:center;gap:9px;padding:9px 12px;border-radius:8px;color:var(--ink);text-decoration:none;font-size:13.5px}.drop a:hover{background:#f3f4f9}.drop a svg{color:var(--sub)}
+h1{font-size:34px;line-height:1.18;font-weight:600;letter-spacing:-.025em;margin:6px 0 12px;max-width:640px}
 .lede{color:var(--mut);font-size:16px;margin:0 0 28px;max-width:560px}
 .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:24px;box-shadow:0 1px 2px #1b1f2e08}
 label{display:block;font-size:13px;font-weight:500;color:var(--sub);margin:0 0 6px}label i{font-style:normal;color:var(--mut);font-weight:400}
@@ -437,13 +489,16 @@ input::placeholder,textarea::placeholder{color:#a9aebd}input:focus,select:focus,
 .chk{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--sub);margin:2px 0 0;font-weight:400}.chk input{width:16px;height:16px;accent-color:var(--g);padding:0}
 .act{display:flex;align-items:center;gap:16px;margin-top:20px;flex-wrap:wrap}
 button{font-size:14px;font-weight:500;height:42px;padding:0 20px;border:0;border-radius:10px;background:var(--g);color:#fff;cursor:pointer;white-space:nowrap;flex:none}button:hover{background:#196a4f}button:disabled{opacity:.5;cursor:default}
-button.quiet{background:#fff;color:var(--ink);border:1px solid var(--line);height:36px;padding:0 14px;font-size:13px}button.quiet:hover{background:#f5f6fa}button.danger{color:#c8372d}
-.hint{color:var(--mut);font-size:13px}.err{color:#c8372d;font-size:13px}.ok{color:var(--g);font-size:13px}
+button.quiet{background:#fff;color:var(--ink);border:1px solid var(--line);height:36px;padding:0 14px;font-size:13px}button.quiet:hover{background:#f5f6fa}button.danger{color:var(--red)}
+button.dangerbtn{background:var(--red);height:36px;padding:0 14px;font-size:13px}button.dangerbtn:hover{background:#a82c24}
+select.mini{height:36px;width:auto;max-width:200px;font-size:13px;padding:0 10px}
+.hint{color:var(--mut);font-size:13px}.err{color:var(--red);font-size:13px}.ok{color:var(--g);font-size:13px}
 #review{margin-top:18px}.rv{max-height:300px;overflow:auto;margin:10px -8px 0;padding:0 8px}.rv label{display:flex;gap:10px;align-items:center;padding:8px 0;border-top:1px solid #eef0f5;margin:0;font-weight:400;color:var(--ink);font-size:13.5px}.rv input{width:16px;height:16px;accent-color:var(--g);flex:none}
-.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin:6px 0 4px}.top h2{font-size:24px;font-weight:600;letter-spacing:-.02em;margin:0;line-height:1.25}
-.top h2{min-width:0;overflow-wrap:anywhere}.meta{color:var(--mut);font-size:13px;margin:6px 0 18px}.meta a{color:var(--sub)}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin:6px 0 4px}.top h2{font-size:24px;font-weight:600;letter-spacing:-.02em;margin:0;line-height:1.25;min-width:0;overflow-wrap:anywhere}
+.tools{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.meta{color:var(--mut);font-size:13px;margin:6px 0 18px}.meta a{color:var(--sub)}
 .bar{height:4px;border-radius:4px;background:#e8eaf1;overflow:hidden}.bar i{display:block;height:100%;width:0;background:var(--g);transition:width .4s}
-.status{display:flex;justify-content:space-between;margin-top:10px;font-size:13px;color:var(--sub)}.status.bad{color:#c8372d}
+.status{display:flex;justify-content:space-between;margin-top:10px;font-size:13px;color:var(--sub)}.status.bad{color:var(--red)}
 details{margin-top:12px;font-size:13px;color:var(--mut)}summary{cursor:pointer}
 pre{margin:8px 0 0;padding:12px;background:#f5f6fa;border-radius:10px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--sub);max-height:200px;overflow-wrap:anywhere;overflow:auto;white-space:pre-wrap}
 .stats{display:flex;gap:34px;margin:22px 0 18px}.stats div{font-size:12.5px;color:var(--mut)}
@@ -454,19 +509,34 @@ a.dl{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none;border
 .row{display:grid;grid-template-columns:48px 168px 1fr;gap:12px;padding:12px 0;border-top:1px solid #eef0f5;font-size:14px;align-items:baseline}.row:first-child{border-top:0}
 .t{color:var(--mut);font-size:12.5px;font-variant-numeric:tabular-nums}.who{font-size:13px;font-weight:500;color:var(--sub);display:flex;align-items:center;gap:7px}.who b{width:6px;height:6px;border-radius:50%;flex:none}
 .x{white-space:pre-line}.empty{color:var(--mut);padding:26px 0;text-align:center;font-size:14px}
-@media(max-width:820px){.app{grid-template-columns:1fr}aside{position:static;height:auto;max-height:340px}main{padding:22px 18px 60px}.two{grid-template-columns:1fr}.row{grid-template-columns:40px 1fr}.row .x{grid-column:1/-1}}
+dialog{border:1px solid var(--line);border-radius:16px;padding:24px;width:min(430px,92vw);color:var(--ink);box-shadow:0 30px 60px -20px #1b1f2e55}dialog::backdrop{background:#1b1f2e59}
+dialog h3{margin:0 0 6px;font-size:17px;font-weight:600;letter-spacing:-.01em}dialog p{margin:0 0 14px;color:var(--sub);font-size:14px;overflow-wrap:anywhere}dialog input{margin-top:6px}
+.dact{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;margin-top:18px}
+@media(max-width:820px){.app{grid-template-columns:1fr}aside{position:static;height:auto;max-height:440px}main{padding:0 18px 60px}.two{grid-template-columns:1fr}.row{grid-template-columns:40px 1fr}.row .x{grid-column:1/-1}}
 </style>
 <div class=app>
 <aside>
  <div class=brand>Podcast SRT</div>
  <button class=ghost id=newbtn>+ New transcript</button>
  <input id=search placeholder="Search history">
+ <div class=shead><span>Projects</span><button id=newproj_btn title="New project" aria-label="New project">+</button></div>
+ <div class=plist id=plist></div>
+ <div class=shead><span id=lhead>All transcripts</span></div>
  <div class=list id=list><div class=nolist>No transcripts yet.</div></div>
  <div class=sfoot><span id=qsum>&nbsp;</span>
-  <span id=who hidden>Signed in as <b id=me></b> &middot; <a href=/logout>Log out</a></span>
   <div class=r><a href=/api/zip id=zip>Download all (.zip)</a><button class=lnk id=retryall hidden>Retry failed</button></div></div>
 </aside>
 <main>
+ <div class=topbar>
+  <div class=menu id=umenu hidden>
+   <button class=user id=ubtn aria-haspopup=menu aria-expanded=false><span class=av id=av></span><span id=uname></span>
+    <svg viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="m6 9 6 6 6-6"/></svg></button>
+   <div class=drop id=udrop hidden role=menu>
+    <div class=who2><small>Signed in as</small><b id=uemail></b></div>
+    <a href=/logout role=menuitem><svg viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.8 stroke-linecap=round stroke-linejoin=round><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>Log out</a>
+   </div>
+  </div>
+ </div>
 <section id=pNew>
  <h1>Turn a YouTube link into a speaker-labelled SRT</h1>
  <p class=lede>Paste one link, many links, or a whole playlist or channel. Every subtitle line comes back with who is speaking.</p>
@@ -483,6 +553,10 @@ a.dl{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none;border
    <div><label>Model</label><select id=model><option>Loading models...</option></select></div>
    <div><label>Speaker names <i>(optional)</i></label><input id=spknames placeholder="Host Name, Guest Name"></div>
   </div>
+  <div class="two f">
+   <div><label>Project <i>(e.g. one per channel)</i></label><select id=proj></select></div>
+   <div id=npw hidden><label>New project name</label><input id=newproj placeholder="Channel or show name" maxlength=60></div>
+  </div>
   <label class=chk><input type=checkbox id=label checked> Label speakers <span class=hint>(slower; turn off for plain text)</span></label>
   <div class=act><button id=go>Generate SRT</button><span class=err id=err></span><span class=ok id=okmsg></span></div>
  </div>
@@ -495,7 +569,7 @@ a.dl{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none;border
 
 <section id=pJob hidden>
  <div class=top><h2 id=jtitle>&nbsp;</h2>
-  <div style="display:flex;gap:8px"><button class="quiet" id=jretry hidden>Retry</button><button class="quiet" id=jcancel hidden>Cancel</button><button class="quiet danger" id=jdel>Delete</button></div></div>
+  <div class=tools><select class=mini id=jproj title="Move to project"></select><button class=quiet id=jretry hidden>Retry</button><button class=quiet id=jcancel hidden>Cancel</button><button class="quiet danger" id=jdel>Delete</button></div></div>
  <div class=meta id=jmeta></div>
  <div id=jrun>
   <div class=bar><i id=bar></i></div>
@@ -514,49 +588,128 @@ a.dl{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none;border
 </section>
 </main>
 </div>
+<dialog id=dlg><h3 id=dtitle></h3><p id=dtext></p><input id=dinput hidden><div class=dact id=dbtns></div></dialog>
 <script>
 const $=id=>document.getElementById(id);
 const COL=['#4f5bd5','#e8743b','#1f7a5c','#2d9cc4','#c79a1f','#b8374a'],esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let sel=null,mode='one',logFrom=0,loaded=null,lastJob=null,review=[];
+const S='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">';
+const IC={folder:S+'<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+ all:S+'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/></svg>',
+ edit:S+'<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
+ trash:S+'<path d="M3 6h18M8 6V4h8v2m-9 0 1 14h8l1-14M10 11v6M14 11v6"/></svg>'};
+let sel=null,mode='one',logFrom=0,loaded=null,lastJob=null,review=[],suggest='',cur='all',projects=[],unfiled=0,jobs=[],counts={};
+const ME="{{USER}}";
 const fmt=t=>{t=Math.round(t);const h=Math.floor(t/3600),m=Math.floor(t%3600/60),x=t%60;return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0')};
 const ago=t=>{const s=Date.now()/1000-t;return s<60?'just now':s<3600?Math.floor(s/60)+' min ago':s<86400?Math.floor(s/3600)+' h ago':Math.floor(s/86400)+' d ago'};
 const api=async(p,body)=>{const r=await fetch(p,body===undefined?{}:{method:'POST',body:JSON.stringify(body)});if(r.status==401){location='/login';throw 0}
  let d={};try{d=await r.json()}catch(e){}return {ok:r.ok,d}};
+
+/* ---- small modal (replaces confirm/prompt) ---- */
+function modal({title,text='',input=null,buttons}){return new Promise(res=>{
+ $('dtitle').textContent=title;$('dtext').textContent=text;$('dtext').hidden=!text;
+ const inp=$('dinput');inp.hidden=!input;if(input){inp.value=input.value||'';inp.placeholder=input.placeholder||''}
+ $('dbtns').innerHTML=buttons.map((b,i)=>`<button type=button class="${b.kind||'quiet'}" data-i="${i}">${esc(b.label)}</button>`).join('');
+ const d=$('dlg'),done=v=>{d.close();res(v)};
+ $('dbtns').querySelectorAll('button').forEach(b=>b.onclick=()=>done({v:buttons[+b.dataset.i].value,text:inp.value.trim()}));
+ d.oncancel=()=>res({v:null,text:''});
+ inp.onkeydown=e=>{if(e.key=='Enter'){e.preventDefault();const p=buttons.find(b=>b.primary);if(p)done({v:p.value,text:inp.value.trim()})}};
+ d.showModal();if(input)inp.focus()})}
+const info=(title,text)=>modal({title,text,buttons:[{label:'OK',kind:'',value:1,primary:true}]});
+
+/* ---- user menu ---- */
+function userUI(){if(!ME)return;$('umenu').hidden=false;$('av').textContent=ME[0];$('uname').textContent=ME.includes('@')?ME.split('@')[0]:ME;$('uemail').textContent=ME}
+const closeMenu=()=>{$('udrop').hidden=true;$('ubtn').setAttribute('aria-expanded','false')};
+$('ubtn').onclick=e=>{e.stopPropagation();const open=$('udrop').hidden;$('udrop').hidden=!open;$('ubtn').setAttribute('aria-expanded',open)};
+document.addEventListener('click',e=>{if(!$('umenu').contains(e.target))closeMenu()});document.addEventListener('keydown',e=>{if(e.key=='Escape')closeMenu()});
+
 function timeUI(){ // 30 s steps for the first 10 min (short tests), then every minute up to 4 h
  const ts=[];for(let t=0;t<=14400;t+=t<600?30:60)ts.push(t);
  const o=ts.map(t=>`<option value="${t}">${fmt(t)}</option>`).join('');
  $('start').innerHTML=o;$('end').innerHTML='<option value="">End of video</option>'+o;
 }
 async function init(){
- timeUI();if("{{USER}}"){$('who').hidden=false;$('me').textContent="{{USER}}"}
+ timeUI();userUI();
  const {d:M}=await api('/api/models');
  $('model').innerHTML=M.stt.map(m=>`<option value="${m.id}">${esc(m.name)} · ${esc(m.price)}</option>`).join('');
  if(M.stt.some(m=>m.id==M.default_stt[0]))$('model').value=M.default_stt[0];
- await loadList();setInterval(tick,2500);
+ await loadProjects();await loadList();setInterval(tick,2500);
 }
 function setMode(m){mode=m;$('m1').className=m=='one'?'on':'';$('mN').className=m=='many'?'on':'';$('f1').hidden=m!='one';$('fN').hidden=m!='many';
  $('go').textContent=m=='one'?'Generate SRT':'Add to queue';$('review').hidden=true;$('err').textContent=$('okmsg').textContent=''}
 $('m1').onclick=()=>setMode('one');$('mN').onclick=()=>setMode('many');
 function showNew(){sel=null;loaded=null;$('pNew').hidden=false;$('pJob').hidden=true;renderList()}
 $('newbtn').onclick=showNew;
-let jobs=[],counts={};
+
+/* ---- projects ---- */
+async function loadProjects(){
+ const {d}=await api('/api/projects');projects=d.projects;unfiled=d.unfiled;
+ if(typeof cur=='number'&&!projects.some(p=>p.id==cur))cur='all';
+ renderProjects();fillSelects()}
+function renderProjects(){
+ const total=Object.values(counts).reduce((a,b)=>a+b,0);
+ const row=(key,icon,name,n,acts)=>`<div class="prow ${String(cur)==String(key)?'on':''}" data-p="${key}">${icon}<span title="${esc(name)}">${esc(name)}</span><em>${n??''}</em><span class=acts>${acts||''}</span></div>`;
+ $('plist').innerHTML=row('all',IC.all,'All transcripts',total||'')+projects.map(p=>row(p.id,IC.folder,p.name,p.total,
+  `<button class=ib data-act=rename data-id="${p.id}" title="Rename" aria-label="Rename">${IC.edit}</button><button class="ib del" data-act=delete data-id="${p.id}" title="Delete project" aria-label="Delete project">${IC.trash}</button>`)).join('')
+  +(unfiled?row('none',IC.folder,'No project',unfiled):'');
+ $('plist').querySelectorAll('.prow').forEach(e=>e.onclick=ev=>{
+  const b=ev.target.closest('[data-act]');if(b){ev.stopPropagation();return projectAction(b.dataset.act,+b.dataset.id)}
+  const k=e.dataset.p;cur=k=='all'||k=='none'?k:+k;pickProject()});
+ $('zip').href='/api/zip'+(cur=='all'?'':'?project='+cur);
+ $('lhead').textContent=cur=='all'?'All transcripts':cur=='none'?'No project':(projects.find(p=>p.id==cur)||{}).name||'Transcripts';
+}
+function fillSelects(){
+ const opts=(extra)=>'<option value="">No project</option>'+projects.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')+(extra||'');
+ const keepF=$('proj').value,keepJ=$('jproj').value;
+ $('proj').innerHTML=opts('<option value="__new">+ New project…</option>');$('jproj').innerHTML=opts();
+ $('proj').value=[...$('proj').options].some(o=>o.value==keepF)?keepF:(typeof cur=='number'?String(cur):'');
+ if(document.activeElement!==$('jproj')&&lastJob)$('jproj').value=lastJob.project_id==null?'':String(lastJob.project_id);else $('jproj').value=keepJ;
+ $('npw').hidden=$('proj').value!='__new';
+}
+function pickProject(){ // clicking a project filters the list and makes it the default for new transcripts
+ renderProjects();loadList();if(typeof cur=='number')$('proj').value=String(cur);else if($('proj').value!='__new')$('proj').value='';$('npw').hidden=$('proj').value!='__new'}
+$('proj').onchange=()=>{$('npw').hidden=$('proj').value!='__new';if(!$('npw').hidden)$('newproj').focus()};
+$('newproj_btn').onclick=async()=>{
+ const r=await modal({title:'New project',text:'Group transcripts, for example one project per channel or show.',input:{placeholder:'Project name'},buttons:[{label:'Cancel',value:'no'},{label:'Create',kind:'',value:'ok',primary:true}]});
+ if(r.v!='ok'||!r.text)return;const {ok,d}=await api('/api/project',{action:'create',name:r.text});
+ if(!ok)return info('Could not create the project',d.error);await loadProjects();cur=d.id;pickProject()};
+async function projectAction(act,id){
+ const p=projects.find(x=>x.id==id);if(!p)return;
+ if(act=='rename'){const r=await modal({title:'Rename project',input:{value:p.name},buttons:[{label:'Cancel',value:'no'},{label:'Save',kind:'',value:'ok',primary:true}]});
+  if(r.v!='ok'||!r.text||r.text==p.name)return;const {ok,d}=await api('/api/project',{action:'rename',id,name:r.text});if(!ok)return info('Could not rename',d.error);await loadProjects();return}
+ const n=p.total,bs=[{label:'Cancel',value:'no'},{label:n?'Delete project only':'Delete project',kind:n?'quiet':'dangerbtn',value:'keep',primary:!n}];
+ if(n)bs.push({label:`Delete project and ${n} transcript${n==1?'':'s'}`,kind:'dangerbtn',value:'all'});
+ const r=await modal({title:`Delete “${p.name}”?`,text:n?`It has ${n} transcript${n==1?'':'s'}. “Delete project only” keeps them under No project.`:'The project is empty.',buttons:bs});
+ if(!r.v||r.v=='no')return;await api('/api/project',{action:'delete',id,delete_jobs:r.v=='all'});
+ if(cur==id)cur='all';if(sel!=null&&r.v=='all'&&lastJob&&lastJob.project_id==id)showNew();await refresh()}
+
+/* ---- history list ---- */
 async function loadList(){
- const {d}=await api('/api/jobs?q='+encodeURIComponent($('search').value.trim()));jobs=d.jobs;counts=d.counts;renderList();
+ const {d}=await api('/api/jobs?q='+encodeURIComponent($('search').value.trim())+(cur=='all'?'':'&project='+cur));jobs=d.jobs;counts=d.counts;renderList();
  const c=counts;$('qsum').textContent=[c.running?'1 running':'',c.queued?c.queued+' queued':'',c.done+' done',c.error?c.error+' failed':''].filter(Boolean).join(' · ');
  $('retryall').hidden=!c.error;
 }
-function sub(j){const by=j.created_by?' · '+j.created_by:'';return (j.status=='running'?(j.detail||'Running'):j.status=='done'?`${j.cues} lines · ${ago(j.finished_at||j.created_at)}`:j.status=='error'?'Failed':j.status=='queued'?'Queued':'Cancelled')+by}
+const refresh=async()=>{await loadProjects();await loadList()};
+function sub(j){const pj=cur=='all'&&j.project_id?(projects.find(p=>p.id==j.project_id)||{}).name:'';
+ const by=[pj,j.created_by].filter(Boolean).join(' · ');
+ return [j.status=='running'?(j.detail||'Running'):j.status=='done'?`${j.cues} lines · ${ago(j.finished_at||j.created_at)}`:j.status=='error'?'Failed':j.status=='queued'?'Queued':'Cancelled',by].filter(Boolean).join(' · ')}
 function renderList(){
- $('list').innerHTML=jobs.length?jobs.map(j=>`<div class="item ${sel==j.id?'on':''}" data-id="${j.id}"><span class="dot ${j.status}"></span><span><b>${esc(j.title||j.video_id||j.url)}</b><small>${esc(sub(j))}</small></span></div>`).join(''):'<div class=nolist>No transcripts yet.</div>';
- document.querySelectorAll('.item').forEach(e=>e.onclick=()=>openJob(+e.dataset.id));
+ $('list').innerHTML=jobs.length?jobs.map(j=>`<div class="item ${sel==j.id?'on':''}" data-id="${j.id}"><span class="dot ${j.status}"></span><span><b>${esc(j.title||j.video_id||j.url)}</b><small>${esc(sub(j))}</small></span>${j.status=='running'?'<span></span>':`<button class="ib del" data-del="${j.id}" title="Delete" aria-label="Delete">${IC.trash}</button>`}</div>`).join(''):'<div class=nolist>No transcripts here yet.</div>';
+ $('list').querySelectorAll('.item').forEach(e=>e.onclick=ev=>{const b=ev.target.closest('[data-del]');if(b){ev.stopPropagation();const j=jobs.find(x=>x.id==+b.dataset.del);return delJob(j.id,j.title||j.video_id)}openJob(+e.dataset.id)});
+ renderProjects();
 }
 let st;$('search').oninput=()=>{clearTimeout(st);st=setTimeout(loadList,250)};
-async function tick(){await loadList();if(sel!=null&&(!lastJob||['queued','running'].includes(lastJob.status)))await pollJob()}
+async function tick(){await loadProjects();await loadList();if(sel!=null&&(!lastJob||['queued','running'].includes(lastJob.status)))await pollJob()}
+async function delJob(id,title){
+ const r=await modal({title:'Delete this transcript?',text:title||'',buttons:[{label:'Cancel',value:'no'},{label:'Delete',kind:'dangerbtn',value:'yes',primary:true}]});
+ if(r.v!='yes')return;await api('/api/delete',{ids:[id]});if(sel==id)showNew();await refresh()}
+
+/* ---- job view ---- */
 async function openJob(id){sel=id;logFrom=0;loaded=null;lastJob=null;$('log').textContent='';$('pNew').hidden=true;$('pJob').hidden=false;$('jout').hidden=true;$('rows').innerHTML='';renderList();await pollJob()}
 async function pollJob(){
  const id=sel,{ok,d:j}=await api(`/api/job/${id}?from=${logFrom}`);if(!ok||id!=sel)return;lastJob=j;logFrom=j.next;
  if(j.log.length){$('log').textContent+=j.log.join('\n')+'\n';$('log').scrollTop=1e9}
  $('jtitle').textContent=j.title||j.video_id||j.url;
+ if(document.activeElement!==$('jproj'))$('jproj').value=j.project_id==null?'':String(j.project_id);
  const range=(j.start_s||j.end_s)?` · ${fmt(j.start_s||0)}–${j.end_s?fmt(j.end_s):'end'}`:'';
  $('jmeta').innerHTML=`<a href="${esc(j.url)}" target=_blank rel=noopener>Open on YouTube</a> · ${esc(j.model)}${range}${j.label_speakers?'':' · no speaker labels'} · added ${ago(j.created_at)}${j.created_by?' by '+esc(j.created_by):''}`;
  const live=j.status=='queued'||j.status=='running';
@@ -565,7 +718,7 @@ async function pollJob(){
  $('detail').textContent=j.status=='error'?(j.error||'Failed. See the log.'):j.status=='cancelled'?'Cancelled':j.status=='queued'?'Waiting in the queue':(j.detail||'Working...');
  $('jstatus').className='status'+(j.status=='error'?' bad':'');
  $('stage').textContent=live?j.stage:'';
- $('jretry').hidden=!(j.status=='error'||j.status=='cancelled');$('jcancel').hidden=j.status!='queued';
+ $('jretry').hidden=!(j.status=='error'||j.status=='cancelled');$('jcancel').hidden=j.status!='queued';$('jdel').hidden=j.status=='running';
  if(j.status=='done'){
   $('s_cost').textContent='$'+(j.cost??0);$('s_time').innerHTML=(j.seconds??0)+' <small>s</small>';$('s_cues').textContent=j.cues;$('s_words').textContent=j.words;
   if(loaded!=id){loaded=id;const {d}=await api(`/api/result/${id}`);if(id==sel)showRows(d.text,id)}
@@ -579,13 +732,19 @@ function showRows(text,id){
 }
 $('jretry').onclick=async()=>{await api('/api/retry',{id:sel});lastJob=null;logFrom=0;$('log').textContent='';await tick()};
 $('jcancel').onclick=async()=>{await api('/api/cancel',{id:sel});lastJob=null;await tick()};
-$('jdel').onclick=async()=>{if(!confirm('Delete this transcript?'))return;await api('/api/delete',{id:sel});showNew();await loadList()};
+$('jdel').onclick=()=>delJob(sel,lastJob&&(lastJob.title||lastJob.video_id));
+$('jproj').onchange=async()=>{const v=$('jproj').value;await api('/api/move',{ids:[sel],project_id:v===''?null:+v});if(lastJob)lastJob.project_id=v===''?null:+v;await refresh()};
 $('retryall').onclick=async()=>{await api('/api/retry',{all_failed:true});await loadList()};
 
+/* ---- new transcript form ---- */
 const params=()=>({start:+$('start').value,end:$('end').value===''?null:+$('end').value,model:$('model').value,speakers:$('spknames').value,label:$('label').checked});
+const projParams=()=>{const v=$('proj').value;return v==='__new'?{new_project:$('newproj').value.trim()}:v===''?{}:{project_id:+v}};
 async function enqueue(items){
  const p=params();if(p.end!=null&&p.end<=p.start)return {error:'End time must be after start time'};
- const {ok,d}=await api('/api/enqueue',{...p,items});return ok?d:{error:d.error||'Failed'};
+ const pp=projParams();if('new_project' in pp&&!pp.new_project)return {error:'Type a name for the new project'};
+ const {ok,d}=await api('/api/enqueue',{...p,...pp,items});if(!ok)return {error:d.error||'Failed'};
+ if(d.project_id){await loadProjects();cur=d.project_id;$('proj').value=String(d.project_id);$('npw').hidden=true;$('newproj').value='';renderProjects()}
+ return d;
 }
 $('go').onclick=async()=>{
  $('err').textContent=$('okmsg').textContent='';$('review').hidden=true;
@@ -594,17 +753,18 @@ $('go').onclick=async()=>{
  try{
   if(mode=='one'){
    const r=await enqueue([{url:$('url').value.trim()}]);if(r.error)return $('err').textContent=r.error;
-   $('url').value='';await loadList();const id=r.ids[0]??(jobs.find(j=>j.url)||{}).id;if(id)openJob(id);else $('okmsg').textContent='Already in the queue.';
+   $('url').value='';await refresh();const id=r.ids[0];if(id)openJob(id);else $('okmsg').textContent='Already in the queue.';
   }else{
    $('okmsg').textContent='Reading links...';
    const {ok,d}=await api('/api/expand',{text:$('urls').value});$('okmsg').textContent='';
    if(!ok)return $('err').textContent=d.error;
    if(!d.items.length)return $('err').textContent='No YouTube links found';
-   if(d.expanded){review=d.items;$('rvtitle').textContent=`Found ${d.items.length} videos`;
+   if(d.expanded){review=d.items;suggest=d.suggest||'';$('rvtitle').textContent=`Found ${d.items.length} videos`+(suggest?` in “${suggest}”`:'');
+    if(suggest&&$('proj').value===''){const ex=projects.find(x=>x.name.toLowerCase()==suggest.toLowerCase());if(ex)$('proj').value=String(ex.id);else{$('proj').value='__new';$('newproj').value=suggest}$('npw').hidden=$('proj').value!='__new'}
     $('rvlist').innerHTML=d.items.map((it,i)=>`<label><input type=checkbox checked data-i="${i}">${esc(it.title||it.id)}</label>`).join('');
     $('rverr').textContent='';$('rvgo').textContent=`Queue ${d.items.length} videos`;$('review').hidden=false;return}
    const r=await enqueue(d.items);if(r.error)return $('err').textContent=r.error;
-   $('urls').value='';$('okmsg').textContent=`Queued ${r.queued} video${r.queued==1?'':'s'}`+(r.duplicates?` (${r.duplicates} already queued)`:'');await loadList();
+   $('urls').value='';$('okmsg').textContent=`Queued ${r.queued} video${r.queued==1?'':'s'}`+(r.duplicates?` (${r.duplicates} already queued)`:'');await refresh();
   }
  }finally{$('go').disabled=false}
 };
@@ -614,7 +774,7 @@ $('rvall').onclick=()=>{const all=[...document.querySelectorAll('#rvlist input')
 $('rvgo').onclick=async()=>{
  const items=picked();if(!items.length)return $('rverr').textContent='Tick at least one video';
  $('rvgo').disabled=true;const r=await enqueue(items);$('rvgo').disabled=false;if(r.error)return $('rverr').textContent=r.error;
- $('review').hidden=true;$('urls').value='';$('okmsg').textContent=`Queued ${r.queued} video${r.queued==1?'':'s'}`+(r.duplicates?` (${r.duplicates} already queued)`:'');await loadList();
+ $('review').hidden=true;$('urls').value='';$('okmsg').textContent=`Queued ${r.queued} video${r.queued==1?'':'s'}`+(r.duplicates?` (${r.duplicates} already queued)`:'');await refresh();
 };
 init();
 </script>

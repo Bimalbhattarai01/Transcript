@@ -41,6 +41,7 @@ python3 ui.py
 ```
 
 Open http://127.0.0.1:8765. Paste one link (or switch to **Many videos** for a list, or a playlist/channel link), pick a start/end time and a model, click **Generate SRT**.
+Use **Projects** (left sidebar, like ChatGPT) to keep each channel or show separate: pick a project when you queue a video, or let a playlist/channel link suggest one. Hover a transcript or project to delete it; open a transcript to move it to another project. Your name and **Log out** are in the menu at the top right.
 Jobs go into a queue stored in SQLite (`data/app.db`); the **History** sidebar lists every job, and a job interrupted by a restart resumes. SRTs are also written to `outputs/`.
 
 For speaker labels install the extra backend once: `pip install sherpa-onnx numpy` (fast, no account needed; its models download to `models/` on first use).
