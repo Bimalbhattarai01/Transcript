@@ -65,11 +65,11 @@ python3 transcribe.py /path/to/episodes
 
 1. Copy the project to the server, e.g. `/opt/transcript` (`git clone` or `rsync`), then `sudo APP_DIR=/opt/transcript bash deploy/setup.sh`.
    It installs ffmpeg/node, a venv with `requirements-vps.txt` (no torch), yt-dlp, and a systemd service `transcribe-ui`.
-2. Edit `/opt/transcript/.env`: `OPENROUTER_API_KEY`, `UI_USER` (default `admin`) and a long `UI_PASSWORD` (single login). The server refuses to listen on a non-loopback address without a password.
-3. `sudo systemctl start transcribe-ui` and watch `journalctl -u transcribe-ui -f`.
+2. Edit `/opt/transcript/.env`: `OPENROUTER_API_KEY`. Then create the team logins (see below); the service refuses to start until at least one user exists.
+3. `sudo -u srt /opt/transcript/.venv/bin/python /opt/transcript/manage.py adduser alice`, then `sudo systemctl start transcribe-ui` and watch `journalctl -u transcribe-ui -f`.
 4. **Simplest and touches nothing else:** open it through an SSH tunnel from your own computer: `ssh -L 8765:127.0.0.1:8765 user@your-server`, then browse http://127.0.0.1:8765. No proxy change, no public port, nothing exposed.
    A public URL (optional, later): the app listens on `127.0.0.1:8765` only. Put a reverse proxy in front: `deploy/nginx.conf` (add it to your existing nginx, then `certbot --nginx -d your.domain`) or `deploy/Caddyfile`.
-   If the proxy runs in Docker it cannot reach the host's `127.0.0.1`: set `UI_HOST=172.17.0.1` (the Docker bridge address; `UI_PASSWORD` is then mandatory), point the proxy at `http://172.17.0.1:8765`, and make sure the firewall does not expose port 8765 to the internet.
+   If the proxy runs in Docker it cannot reach the host's `127.0.0.1`: set `UI_HOST=172.17.0.1` (the Docker bridge address; login is then mandatory), point the proxy at `http://172.17.0.1:8765`, and make sure the firewall does not expose port 8765 to the internet.
 
 The service runs at low priority (`Nice=10`, `CPUQuota=300%`, `MemoryMax=4G`, `DIARIZE_THREADS=3`) so other services on the same machine stay responsive; adjust in `deploy/transcribe-ui.service`.
 
@@ -83,3 +83,18 @@ Back up `data/app.db` (it holds the whole history and every SRT). `KEEP_AUDIO=0`
 ssh-keygen -t ed25519 -f ~/.ssh/transcript_deploy -N "" && cat ~/.ssh/transcript_deploy.pub
 GIT_SSH_COMMAND="ssh -i ~/.ssh/transcript_deploy -o IdentitiesOnly=yes" git clone git@github.com:Bimalbhattarai01/Transcript.git /opt/transcript
 ```
+
+### Team logins
+
+Accounts live in the database; there is no signup page, so only someone with shell access to the server can add people. History is shared by the whole team and each job shows who added it.
+
+```bash
+M="sudo -u srt /opt/transcript/.venv/bin/python /opt/transcript/manage.py"
+$M adduser alice      # asks for a password (min 10 characters)
+$M listusers
+$M passwd alice       # also signs alice out everywhere
+$M disable alice      # / enable alice  (takes effect immediately)
+$M deluser alice
+```
+
+Update the server later with `cd /opt/transcript && git pull` (use the deploy key as above), `sudo chown -R srt:srt /opt/transcript`, `sudo systemctl restart transcribe-ui`. An existing database upgrades itself.

@@ -7,7 +7,7 @@ Wants=network-online.target
 User=srt
 WorkingDirectory=/opt/transcript
 EnvironmentFile=/opt/transcript/.env
-Environment=UI_HOST=127.0.0.1 UI_PORT=8765 NO_BROWSER=1 KEEP_AUDIO=0 DIARIZER=fast DIARIZE_THREADS=3
+Environment=UI_HOST=127.0.0.1 UI_PORT=8765 UI_REQUIRE_LOGIN=1 NO_BROWSER=1 KEEP_AUDIO=0 DIARIZER=fast DIARIZE_THREADS=3
 ExecStart=/opt/transcript/.venv/bin/python ui.py
 Restart=always
 RestartSec=5

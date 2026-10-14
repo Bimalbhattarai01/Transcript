@@ -35,8 +35,10 @@ cat <<MSG
 Done. This touched only: $APP_DIR, a new user '$APP_USER', the apt packages ffmpeg/python3-venv/python3-pip/curl, and /etc/systemd/system/transcribe-ui.service.
 Your other services, Docker and your proxy were not changed.
 Next:
-  1. Edit $APP_DIR/.env : OPENROUTER_API_KEY, UI_PASSWORD (long!), optionally YT_COOKIES
-  2. systemctl start transcribe-ui && journalctl -u transcribe-ui -f
-  3. Open it WITHOUT touching your proxy: from your own computer run   ssh -L 8765:127.0.0.1:8765 user@this-server   then browse http://127.0.0.1:8765
+  1. Edit $APP_DIR/.env : OPENROUTER_API_KEY, optionally YT_COOKIES
+  2. Create the first team login (asks for a password, min 10 chars):
+       sudo -u $APP_USER $APP_DIR/.venv/bin/python $APP_DIR/manage.py adduser alice
+  3. systemctl start transcribe-ui && journalctl -u transcribe-ui -f
+  4. Open it WITHOUT touching your proxy: from your own computer run   ssh -L 8765:127.0.0.1:8765 user@this-server   then browse http://127.0.0.1:8765
      (optional, later: a public URL via deploy/nginx.conf)
 MSG
