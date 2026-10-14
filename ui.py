@@ -115,16 +115,20 @@ def download(io, url, vid):
     p = subprocess.Popen(ytdlp_cmd() + ["--no-playlist", "--newline", "-f", "bestaudio", "-x", "--audio-format", "mp3",
                                         "--print", "after_move:filepath", "-o", str(DL / "%(id)s.%(ext)s"), url],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    path = None
+    path, blocked = None, False
     for line in p.stdout:
         line = line.strip()
+        blocked = blocked or "not a bot" in line
         if m := re.search(r"\[download\]\s+([\d.]+)%", line):
             io.set(progress=float(m[1]), detail=f"Downloading audio {float(m[1]):.0f}%")
         elif line.startswith("/") and line.endswith(".mp3"):
             path = line
         elif line and not line.startswith("[download]"):
             io.log(line)
-    if p.wait() != 0 or not path: raise RuntimeError("yt-dlp failed (see log)")
+    if p.wait() != 0 or not path:
+        if blocked:
+            raise RuntimeError("YouTube blocked this server (\"confirm you're not a bot\"). Use the Upload file tab, or ask the admin to add YouTube cookies.")
+        raise RuntimeError("yt-dlp failed (see log)")
     io.log(f"Downloaded {Path(path).name}")
     return path
 
