@@ -358,23 +358,46 @@ class H(BaseHTTPRequestHandler):
 
 LOGIN = r"""<!doctype html><meta charset=utf-8><title>Sign in &middot; Podcast SRT</title><meta name=viewport content="width=device-width,initial-scale=1">
 <style>@font-face{font-family:Inter;src:url(/static/Inter.woff2) format("woff2");font-weight:100 900;font-display:swap}
-:root{--ink:#1b1f2e;--mut:#8a90a2;--line:#e4e7ee;--g:#1f7a5c}*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif;-webkit-font-smoothing:antialiased;
- background:radial-gradient(900px 380px at 20% -8%,#e8ebfb,transparent 70%),radial-gradient(700px 320px at 95% 0,#eef0f8,transparent 70%),#f7f8fc}
-.box{width:100%;max-width:380px}.brand{font-weight:600;font-size:14px;margin-bottom:34px}
-h1{font-size:30px;line-height:1.2;font-weight:600;letter-spacing:-.025em;margin:0 0 8px}.sub{color:var(--mut);margin:0 0 26px}
-form{background:#fff;border:1px solid var(--line);border-radius:14px;padding:24px;box-shadow:0 1px 2px #1b1f2e08}
-label{display:block;font-size:13px;font-weight:500;color:#6b7186;margin:0 0 6px}
-input,button{font:inherit;width:100%;height:44px;border-radius:10px}
-input{border:1px solid var(--line);padding:0 12px;margin-bottom:16px;outline:none;transition:border-color .12s,box-shadow .12s}input:focus{border-color:var(--g);box-shadow:0 0 0 3px #1f7a5c1a}
-button{background:var(--g);color:#fff;border:0;font-weight:500;cursor:pointer;margin-top:4px}button:hover{background:#196a4f}
-.e{color:#c8372d;font-size:13px;margin:0 0 14px}.e:empty{display:none}.foot{color:var(--mut);font-size:13px;margin-top:18px}</style>
-<div class=box><div class=brand>Podcast SRT</div><h1>Sign in</h1><p class=sub>Internal team access.</p>
-<form method=post action=/login><p class=e>{{ERR}}</p>
-<label>Email or username</label><input name=username autocomplete=username autocapitalize=off spellcheck=false autofocus required>
-<label>Password</label><input type=password name=password autocomplete=current-password required>
-<button>Sign in</button></form>
-<p class=foot>No account? Ask the person who runs this server to add you.</p></div>"""
+:root{--ink:#1b1f2e;--mut:#8a90a2;--sub:#6b7186;--line:#e4e7ee;--g:#1f7a5c}*{box-sizing:border-box}
+body{margin:0;min-height:100vh;color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif;font-feature-settings:"cv11","ss03";-webkit-font-smoothing:antialiased;
+ background:radial-gradient(900px 420px at 12% -10%,#e6e9fb,transparent 70%),radial-gradient(700px 360px at 100% 0,#eef0f8,transparent 70%),#f7f8fc}
+.page{min-height:100vh;display:grid;grid-template-columns:1.1fr 1fr;align-items:center;gap:56px;max-width:1080px;margin:0 auto;padding:40px 28px}
+.brand{font-weight:600;font-size:15px;position:absolute;top:30px;left:max(28px,calc((100vw - 1080px)/2 + 28px))}
+.pitch h1{font-size:44px;line-height:1.1;font-weight:600;letter-spacing:-.03em;margin:0 0 16px;max-width:480px}
+.pitch p{color:var(--mut);font-size:17px;margin:0;max-width:420px}
+form{background:#fff;border:1px solid var(--line);border-radius:16px;padding:30px;box-shadow:0 1px 2px #1b1f2e08,0 18px 40px -22px #1b1f2e26;max-width:400px;width:100%;justify-self:end}
+form h2{font-size:20px;font-weight:600;letter-spacing:-.02em;margin:0 0 4px}.hint{color:var(--mut);font-size:13.5px;margin:0 0 22px}
+label{display:block;font-size:13px;font-weight:500;color:var(--sub);margin:0 0 6px}
+.field{position:relative;margin-bottom:16px}
+input{font:inherit;font-size:14.5px;width:100%;height:44px;padding:0 12px;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink);outline:none;transition:border-color .12s,box-shadow .12s}
+input::placeholder{color:#b0b5c3}input:focus{border-color:var(--g);box-shadow:0 0 0 3px #1f7a5c1a}
+.field input[type=password],.field input.pw{padding-right:62px}
+.eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);height:32px;width:auto;padding:0 10px;border:0;background:none;color:var(--sub);font:inherit;font-size:12.5px;font-weight:500;cursor:pointer;border-radius:8px}.eye:hover{background:#f1f2f8}
+.go{font:inherit;font-size:14.5px;font-weight:500;width:100%;height:46px;border:0;border-radius:10px;background:var(--g);color:#fff;cursor:pointer;margin-top:6px;transition:background .12s}
+.go:hover{background:#196a4f}.go:disabled{opacity:.6;cursor:default}
+.e{background:#fdf0ef;color:#b3302a;font-size:13px;border-radius:9px;padding:9px 12px;margin:0 0 16px}.e:empty{display:none}
+.caps{color:#b07a12;font-size:12.5px;margin:-8px 0 12px;display:none}
+.foot{color:var(--mut);font-size:13px;margin:18px 0 0;text-align:center}
+@media(max-width:860px){.page{grid-template-columns:1fr;gap:28px;padding:92px 20px 40px}.brand{left:20px}.pitch h1{font-size:32px}.pitch p{font-size:15.5px}form{justify-self:stretch;max-width:none}}</style>
+<div class=brand>Podcast SRT</div>
+<div class=page>
+ <div class=pitch><h1>Turn a YouTube link into a speaker-labelled SRT</h1><p>Paste a link, or a whole playlist, and get subtitles that say who is speaking. For the team only.</p></div>
+ <form method=post action=/login id=f>
+  <h2>Sign in</h2><p class=hint>Use the email or username your admin gave you.</p>
+  <p class=e role=alert>{{ERR}}</p>
+  <div class=field><label for=u>Email or username</label><input id=u name=username autocomplete=username autocapitalize=off spellcheck=false autofocus required></div>
+  <div class=field><label for=p>Password</label><input id=p type=password name=password autocomplete=current-password required><button type=button class=eye id=eye>Show</button></div>
+  <div class=caps id=caps>Caps Lock is on</div>
+  <button class=go id=go>Sign in</button>
+  <p class=foot>No account? Ask the person who runs this server to add you.</p>
+ </form>
+</div>
+<script>
+const p=document.getElementById('p'),eye=document.getElementById('eye');
+eye.onclick=()=>{const show=p.type=='password';p.type=show?'text':'password';eye.textContent=show?'Hide':'Show'};
+p.addEventListener('keyup',e=>{document.getElementById('caps').style.display=e.getModifierState&&e.getModifierState('CapsLock')?'block':'none'});
+document.getElementById('f').addEventListener('submit',()=>{const b=document.getElementById('go');b.disabled=true;b.textContent='Signing in...'});
+</script>"""
 
 
 PAGE = r"""<!doctype html><meta charset=utf-8><title>Podcast SRT</title><meta name=viewport content="width=device-width,initial-scale=1">
