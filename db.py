@@ -20,12 +20,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at REAL, started_at REAL, finished_at REAL);
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS jobs_video ON jobs(video_id);
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, created_by TEXT, created_at REAL);
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE, pw_hash TEXT NOT NULL,
     disabled INTEGER NOT NULL DEFAULT 0, created_at REAL, last_login REAL);
 """
 LIST_COLS = ("id, batch_id, url, video_id, title, status, stage, progress, detail, start_s, end_s, model, label_speakers, "
-             "cost, seconds, cues, words, error, created_by, created_at, started_at, finished_at")
+             "cost, seconds, cues, words, error, created_by, project_id, created_at, started_at, finished_at")
 
 
 def default_path():
@@ -42,8 +44,10 @@ def init(path):
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL"); _conn.execute("PRAGMA busy_timeout=5000")
         _conn.executescript(SCHEMA)
-        if "created_by" not in {r[1] for r in _conn.execute("PRAGMA table_info(jobs)")}:  # databases made before accounts existed
-            _conn.execute("ALTER TABLE jobs ADD COLUMN created_by TEXT")
+        cols = {r[1] for r in _conn.execute("PRAGMA table_info(jobs)")}
+        for col, typ in (("created_by", "TEXT"), ("project_id", "INTEGER")):  # databases made before accounts/projects existed
+            if col not in cols: _conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
+        _conn.execute("CREATE INDEX IF NOT EXISTS jobs_project ON jobs(project_id)")
         # a crash/restart mid-job: put it back in the queue (chunk + diarization caches make the retry cheap)
         _conn.execute("UPDATE jobs SET status='queued', stage='queued', progress=0, detail='' WHERE status='running'")
 
@@ -62,10 +66,11 @@ def add_batch(name):
     return x("INSERT INTO batches(name, created_at) VALUES(?,?)", (name, time.time()))
 
 
-def add_job(batch_id, url, video_id, title, start_s, end_s, model, speakers_hint, label_speakers, created_by=None):
-    return x("INSERT INTO jobs(batch_id,url,video_id,title,start_s,end_s,model,speakers_hint,label_speakers,created_by,created_at) "
-             "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-             (batch_id, url, video_id, title, start_s, end_s, model, speakers_hint, int(bool(label_speakers)), created_by, time.time()))
+def add_job(batch_id, url, video_id, title, start_s, end_s, model, speakers_hint, label_speakers, created_by=None, project_id=None):
+    return x("INSERT INTO jobs(batch_id,url,video_id,title,start_s,end_s,model,speakers_hint,label_speakers,created_by,project_id,created_at) "
+             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+             (batch_id, url, video_id, title, start_s, end_s, model, speakers_hint, int(bool(label_speakers)), created_by, project_id,
+              time.time()))
 
 
 def get(jid, cols="*"):
@@ -87,12 +92,76 @@ def next_queued():
     return r[0] if r else None
 
 
-def list_jobs(search="", limit=500):
+def _scope(project):
+    """SQL condition for a project filter: None = everything, 0 = no project, n = that project."""
+    if project is None: return "", ()
+    return ("project_id IS NULL", ()) if project == 0 else ("project_id=?", (project,))
+
+
+def list_jobs(search="", project=None, limit=500):
+    conds, args = [], []
     if search:
-        like = f"%{search}%"
-        return q(f"SELECT {LIST_COLS} FROM jobs WHERE title LIKE ? OR url LIKE ? OR video_id LIKE ? ORDER BY id DESC LIMIT ?",
-                 (like, like, like, limit))
-    return q(f"SELECT {LIST_COLS} FROM jobs ORDER BY id DESC LIMIT ?", (limit,))
+        like = f"%{search}%"; conds.append("(title LIKE ? OR url LIKE ? OR video_id LIKE ?)"); args += [like, like, like]
+    c, a2 = _scope(project)
+    if c: conds.append(c); args += list(a2)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    return q(f"SELECT {LIST_COLS} FROM jobs {where} ORDER BY id DESC LIMIT ?", (*args, limit))
+
+
+def delete_jobs(ids):
+    """Delete finished/failed/queued jobs (never a running one). Returns how many were removed."""
+    ids = [int(i) for i in ids]
+    if not ids: return 0
+    with _lock:
+        n = _conn.execute(f"DELETE FROM jobs WHERE status<>'running' AND id IN ({','.join('?' * len(ids))})", ids).rowcount
+    return n
+
+
+def move_jobs(ids, project_id):
+    ids = [int(i) for i in ids]
+    if ids: x(f"UPDATE jobs SET project_id=? WHERE id IN ({','.join('?' * len(ids))})", (project_id, *ids))
+
+
+# ---------- projects (folders for jobs, e.g. one per channel) ----------
+def _clean_project(name):
+    name = " ".join((name or "").split())
+    if not 1 <= len(name) <= 60: raise ValueError("project name: 1-60 characters")
+    return name
+
+
+def add_project(name, created_by=None):
+    name = _clean_project(name)
+    r = q("SELECT id FROM projects WHERE name=?", (name,))
+    if r: raise ValueError(f"a project called '{name}' already exists")
+    return x("INSERT INTO projects(name, created_by, created_at) VALUES(?,?,?)", (name, created_by, time.time()))
+
+
+def rename_project(pid, name):
+    name = _clean_project(name)
+    r = q("SELECT id FROM projects WHERE name=? AND id<>?", (name, pid))
+    if r: raise ValueError(f"a project called '{name}' already exists")
+    x("UPDATE projects SET name=? WHERE id=?", (name, pid))
+
+
+def delete_project(pid, delete_jobs_too=False):
+    if delete_jobs_too:
+        ids = [r["id"] for r in q("SELECT id FROM jobs WHERE project_id=?", (pid,))]
+        delete_jobs(ids)
+    x("UPDATE jobs SET project_id=NULL WHERE project_id=?", (pid,))  # anything left (e.g. a running job) is un-filed, not lost
+    x("DELETE FROM projects WHERE id=?", (pid,))
+
+
+def list_projects():
+    return q("SELECT p.id, p.name, COUNT(j.id) total, COALESCE(SUM(j.status='done'), 0) done FROM projects p "
+             "LEFT JOIN jobs j ON j.project_id=p.id GROUP BY p.id ORDER BY p.name COLLATE NOCASE")
+
+
+def project_exists(pid):
+    return bool(q("SELECT 1 FROM projects WHERE id=?", (pid,)))
+
+
+def unfiled_count():
+    return q("SELECT COUNT(*) n FROM jobs WHERE project_id IS NULL")[0]["n"]
 
 
 def counts():
