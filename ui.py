@@ -56,7 +56,7 @@ def video_id(url):
 
 
 def ytdlp_cmd():
-    exe = str(ROOT / "bin" / "yt-dlp") if (ROOT / "bin" / "yt-dlp").exists() else "yt-dlp"
+    exe = next((str(p) for p in (DATA / "bin" / "yt-dlp", ROOT / "bin" / "yt-dlp") if p.exists()), "yt-dlp")
     cmd = [exe, "--js-runtimes", "node", "--remote-components", "ejs:github"]  # YouTube needs a JS runtime (node) + fresh yt-dlp
     if os.environ.get("YT_COOKIES"): cmd += ["--cookies", os.environ["YT_COOKIES"]]  # datacenter IPs are often asked to prove they're human
     if os.environ.get("YT_PROXY"): cmd += ["--proxy", os.environ["YT_PROXY"]]
@@ -356,13 +356,25 @@ class H(BaseHTTPRequestHandler):
         self.send(404, "{}")
 
 
-LOGIN = r"""<!doctype html><meta charset=utf-8><title>Sign in</title><meta name=viewport content="width=device-width,initial-scale=1">
-<style>@font-face{font-family:Inter;src:url(/static/Inter.woff2) format("woff2");font-weight:100 900}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f8fc;font:15px Inter,system-ui,sans-serif;color:#1b1f2e}
-form{background:#fff;border:1px solid #e4e7ee;border-radius:14px;padding:28px;width:320px}h1{font-size:20px;font-weight:600;letter-spacing:-.02em;margin:0 0 18px}
-input,button{font:inherit;width:100%;height:42px;border-radius:10px;border:1px solid #e4e7ee;padding:0 12px}input{margin-bottom:12px;outline:none}input:focus{border-color:#1f7a5c}
-button{background:#1f7a5c;color:#fff;border:0;font-weight:500;cursor:pointer}.e{color:#c8372d;font-size:13px;margin:0 0 10px}.hint{color:#8a90a2;font-size:13px;margin:-8px 0 14px}.e:empty{display:none}</style>
-<form method=post action=/login><h1>Podcast SRT</h1><p class=hint>Team sign in</p><p class=e>{{ERR}}</p><input name=username placeholder=Username autocomplete=username autofocus><input type=password name=password placeholder=Password autocomplete=current-password><button>Sign in</button></form>"""
+LOGIN = r"""<!doctype html><meta charset=utf-8><title>Sign in &middot; Podcast SRT</title><meta name=viewport content="width=device-width,initial-scale=1">
+<style>@font-face{font-family:Inter;src:url(/static/Inter.woff2) format("woff2");font-weight:100 900;font-display:swap}
+:root{--ink:#1b1f2e;--mut:#8a90a2;--line:#e4e7ee;--g:#1f7a5c}*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif;-webkit-font-smoothing:antialiased;
+ background:radial-gradient(900px 380px at 20% -8%,#e8ebfb,transparent 70%),radial-gradient(700px 320px at 95% 0,#eef0f8,transparent 70%),#f7f8fc}
+.box{width:100%;max-width:380px}.brand{font-weight:600;font-size:14px;margin-bottom:34px}
+h1{font-size:30px;line-height:1.2;font-weight:600;letter-spacing:-.025em;margin:0 0 8px}.sub{color:var(--mut);margin:0 0 26px}
+form{background:#fff;border:1px solid var(--line);border-radius:14px;padding:24px;box-shadow:0 1px 2px #1b1f2e08}
+label{display:block;font-size:13px;font-weight:500;color:#6b7186;margin:0 0 6px}
+input,button{font:inherit;width:100%;height:44px;border-radius:10px}
+input{border:1px solid var(--line);padding:0 12px;margin-bottom:16px;outline:none;transition:border-color .12s,box-shadow .12s}input:focus{border-color:var(--g);box-shadow:0 0 0 3px #1f7a5c1a}
+button{background:var(--g);color:#fff;border:0;font-weight:500;cursor:pointer;margin-top:4px}button:hover{background:#196a4f}
+.e{color:#c8372d;font-size:13px;margin:0 0 14px}.e:empty{display:none}.foot{color:var(--mut);font-size:13px;margin-top:18px}</style>
+<div class=box><div class=brand>Podcast SRT</div><h1>Sign in</h1><p class=sub>Internal team access.</p>
+<form method=post action=/login><p class=e>{{ERR}}</p>
+<label>Email or username</label><input name=username autocomplete=username autocapitalize=off spellcheck=false autofocus required>
+<label>Password</label><input type=password name=password autocomplete=current-password required>
+<button>Sign in</button></form>
+<p class=foot>No account? Ask the person who runs this server to add you.</p></div>"""
 
 
 PAGE = r"""<!doctype html><meta charset=utf-8><title>Podcast SRT</title><meta name=viewport content="width=device-width,initial-scale=1">
